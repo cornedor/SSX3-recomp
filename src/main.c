@@ -33,6 +33,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* REG_RIP in ucontext (x86-64 crash report) */
+#endif
 #include "platform/win32_compat.h"
 #endif
 #ifdef _WIN32

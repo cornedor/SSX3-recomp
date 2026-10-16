@@ -6596,10 +6596,10 @@ index 08bae4b..1b0e0d8 100644
  #endif
 diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
 new file mode 100644
-index 0000000..748ee10
+index 0000000..25a6991
 --- /dev/null
 +++ b/src/video/fb_present_sdl.c
-@@ -0,0 +1,437 @@
+@@ -0,0 +1,474 @@
 +/**
 + * POSIX counterpart of fb_present.c: show the guest framebuffer in an SDL2
 + * window. Same contract (RECOMP_FB_WINDOW, flip-time copy, BMP dump, snap
@@ -6900,15 +6900,43 @@ index 0000000..748ee10
 +    int f0 = 0;
 +
 +    (void)unused;
++    /* Wayland: native when the session has it (RECOMP_WAYLAND=0: let SDL
++     * pick, i.e. usually X11 through Xwayland). SDL_VIDEODRIVER still wins. */
++    {
++        const char *wl = getenv("RECOMP_WAYLAND");
++        if (getenv("WAYLAND_DISPLAY") && !getenv("SDL_VIDEODRIVER") && !(wl && *wl == '0'))
++            SDL_SetHint("SDL_VIDEODRIVER", "wayland,x11");
++        SDL_SetHint("SDL_APP_ID", "ssx3-recomp");              /* Wayland app_id */
++        SDL_SetHint("SDL_VIDEO_WAYLAND_WMCLASS", "ssx3-recomp");
++        SDL_SetHint("SDL_VIDEO_X11_WMCLASS", "ssx3-recomp");
++        /* The frame is scaled to the window: filtered, not nearest. */
++        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
++    }
 +    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
 +        fprintf(stderr, "  [FBWIN] SDL video init failed: %s\n", SDL_GetError());
 +        s_fb_running = 0;
 +        return NULL;
 +    }
-+    win = SDL_CreateWindow("Xbox Recomp - Framebuffer",
-+                           SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-+                           (int)s_fb_width, (int)s_fb_height,
-+                           SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
++    {
++        /* RECOMP_WINDOW=WxH, else 4:3 at 3/4 of the display's height (a
++         * 640x480 window is a stamp on a modern screen); RECOMP_FULLSCREEN=1
++         * starts fullscreen (F11 / Alt+Enter toggle). HiDPI: the renderer
++         * draws at the output's real pixels, not a scaled-up logical size. */
++        const char *ws = getenv("RECOMP_WINDOW"), *fs = getenv("RECOMP_FULLSCREEN");
++        int ww = (int)s_fb_width, wh = (int)s_fb_height;
++        SDL_DisplayMode dm;
++        if (ws && sscanf(ws, "%dx%d", &ww, &wh) == 2 && ww > 0 && wh > 0)
++            ;
++        else if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.h > 0) {
++            wh = dm.h * 3 / 4;
++            ww = wh * 4 / 3;
++            if (wh < (int)s_fb_height) { ww = (int)s_fb_width; wh = (int)s_fb_height; }
++        }
++        win = SDL_CreateWindow("Xbox Recomp - Framebuffer",
++                               SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ww, wh,
++                               SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
++                               | (fs && *fs == '1' ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
++    }
 +    ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_PRESENTVSYNC) : NULL;
 +    tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
 +                                  SDL_TEXTUREACCESS_STREAMING,
@@ -6920,8 +6948,12 @@ index 0000000..748ee10
 +    }
 +    SDL_RenderSetLogicalSize(ren, (int)s_fb_width, (int)s_fb_height);
 +    s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
-+    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
-+            s_fb_width, s_fb_height);
++    {
++        int ww, wh;
++        SDL_GetWindowSize(win, &ww, &wh);
++        fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u frame, %dx%d window, %s)\n",
++                s_fb_width, s_fb_height, ww, wh, SDL_GetCurrentVideoDriver());
++    }
 +
 +    while (s_fb_running) {
 +        SDL_Event e;
@@ -6934,6 +6966,11 @@ index 0000000..748ee10
 +                 * next flip reopened it. */
 +                fflush(NULL);
 +                _exit(0);
++            } else if (e.type == SDL_KEYDOWN && !e.key.repeat
++                       && (e.key.keysym.sym == SDLK_F11
++                           || (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
++                SDL_SetWindowFullscreen(win, (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN)
++                                             ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
 +            } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
 +                int vk = sdl_to_vk(e.key.keysym.sym);
 +                if (vk)

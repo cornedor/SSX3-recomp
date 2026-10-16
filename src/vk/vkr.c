@@ -10,8 +10,11 @@
 #include "xbox_frag_spv.h"
 #include "xbox_frag_wdepth_spv.h"
 #include "xbox_vsh_vert_spv.h"
+#include "crt_vert_spv.h"
+#include "crt_frag_spv.h"
 #ifdef _WIN32
 #include <windows.h>
+#define strtok_r strtok_s
 #else
 #include <time.h>
 #endif
@@ -148,6 +151,21 @@ struct VkrContext {
     double prof_thr, ts_period;
     unsigned prof_said;
     float vsh_consts[192][4];
+
+    /* RECOMP_CRT=1: CRT post-process of the full-resolution image (crt.frag).
+     * crt_in: the frame with mips, crt_out: what the window gets. */
+    int crt;
+    float crt_p[10];                /* curv scan mask vig ab glow bright mpitch flicker noise;
+                                     * mpitch 0 = auto */
+    VkDescriptorSetLayout crt_dsl;
+    VkPipelineLayout crt_layout;
+    VkShaderModule crt_vs, crt_fs;
+    VkPipeline crt_pipe;
+    VkSampler crt_samp;
+    VkImage crt_in, crt_out;
+    VkDeviceMemory crt_in_mem, crt_out_mem;
+    VkImageView crt_in_view, crt_out_view;
+    uint32_t crt_levels;
 };
 
 static void use_frame(VkrContext *c, int i)
@@ -232,9 +250,9 @@ static int make_buffer_ex(VkrContext *c, VkDeviceSize size, VkBufferUsageFlags u
     return 1;
 }
 
-static int make_image(VkrContext *c, VkFormat fmt, VkImageUsageFlags usage,
-                      VkImageAspectFlags aspect, VkImage *img, VkDeviceMemory *mem,
-                      VkImageView *view, uint32_t width, uint32_t height)
+static int make_image_ex(VkrContext *c, VkFormat fmt, VkImageUsageFlags usage,
+                         VkImageAspectFlags aspect, VkImage *img, VkDeviceMemory *mem,
+                         VkImageView *view, uint32_t width, uint32_t height, uint32_t levels)
 {
     VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     VkMemoryRequirements mr;
@@ -243,7 +261,7 @@ static int make_image(VkrContext *c, VkFormat fmt, VkImageUsageFlags usage,
     int t;
     ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt;
     ii.extent.width = width; ii.extent.height = height; ii.extent.depth = 1;
-    ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.mipLevels = levels; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = usage;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     CK(vkCreateImage(c->dev, &ii, NULL, img));
@@ -255,9 +273,35 @@ static int make_image(VkrContext *c, VkFormat fmt, VkImageUsageFlags usage,
     CK(vkBindImageMemory(c->dev, *img, *mem, 0));
     vi.image = *img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = fmt;
     vi.subresourceRange.aspectMask = aspect;
-    vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
+    vi.subresourceRange.levelCount = levels; vi.subresourceRange.layerCount = 1;
     CK(vkCreateImageView(c->dev, &vi, NULL, view));
     return 1;
+}
+
+static int make_image(VkrContext *c, VkFormat fmt, VkImageUsageFlags usage,
+                      VkImageAspectFlags aspect, VkImage *img, VkDeviceMemory *mem,
+                      VkImageView *view, uint32_t width, uint32_t height)
+{
+    return make_image_ex(c, fmt, usage, aspect, img, mem, view, width, height, 1);
+}
+
+/* Colour mip levels [base, base + n) of img. */
+static void barrier_mips(VkrContext *c, VkImage img, uint32_t base, uint32_t n,
+                         VkImageLayout from, VkImageLayout to,
+                         VkPipelineStageFlags2 ss, VkAccessFlags2 sa,
+                         VkPipelineStageFlags2 ds, VkAccessFlags2 da)
+{
+    VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    VkDependencyInfo d = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    b.srcStageMask = ss; b.srcAccessMask = sa; b.dstStageMask = ds; b.dstAccessMask = da;
+    b.oldLayout = from; b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.baseMipLevel = base;
+    b.subresourceRange.levelCount = n; b.subresourceRange.layerCount = 1;
+    d.imageMemoryBarrierCount = 1; d.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(c->cmd, &d);
 }
 
 static void barrier(VkrContext *c, VkImage img, VkImageAspectFlags aspect,
@@ -344,6 +388,94 @@ static int make_layout(VkrContext *c)
     li.setLayoutCount = 1; li.pSetLayouts = &c->dsl;
     li.pushConstantRangeCount = 2; li.pPushConstantRanges = pcr;
     CK(vkCreatePipelineLayout(c->dev, &li, NULL, &c->layout));
+    return 1;
+}
+
+/* RECOMP_CRT=1 [RECOMP_CRT_PARAMS=name=value,...]: the CRT post-pass. */
+static const char *const crt_names[10] = {
+    "curv", "scan", "mask", "vig", "ab", "glow", "bright", "mpitch", "flicker", "noise"};
+
+static void crt_config(VkrContext *c)
+{
+    static const float def[10] = {0.18f, 0.6f, 0.35f, 0.35f, 0.8f, 0.4f, 1.1f, 0.0f, 0.0f, 0.25f};
+    const char *e = getenv("RECOMP_CRT");
+    char buf[512], *tok, *save = NULL;
+    int i;
+    c->crt = e && *e && *e != '0';
+    memcpy(c->crt_p, def, sizeof def);
+    e = getenv("RECOMP_CRT_PARAMS");
+    if (!c->crt || !e)
+        return;
+    snprintf(buf, sizeof buf, "%s", e);
+    for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        char *eq = strchr(tok, '=');
+        if (!eq) continue;
+        *eq = 0;
+        for (i = 0; i < 10; i++)
+            if (!strcmp(tok, crt_names[i]))
+                c->crt_p[i] = (float)atof(eq + 1);
+    }
+}
+
+static int make_crt(VkrContext *c)
+{
+    VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                      VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkPushConstantRange pcr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 72};
+    VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkPipelineShaderStageCreateInfo stg[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_VERTEX_BIT, 0, "main", 0},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_FRAGMENT_BIT, 0, "main", 0},
+    };
+    VkPipelineVertexInputStateCreateInfo vin = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cba = {0};
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    VkFormat cf = VK_FORMAT_B8G8R8A8_UNORM;
+    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo pi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+
+    c->crt_vs = shader(c, crt_vert_spv, crt_vert_spv_len);
+    c->crt_fs = shader(c, crt_frag_spv, crt_frag_spv_len);
+    if (!c->crt_vs || !c->crt_fs) { fprintf(stderr, "[VKR] CRT shader module failed\n"); return 0; }
+    di.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
+    di.bindingCount = 1; di.pBindings = &b;
+    CK(vkCreateDescriptorSetLayout(c->dev, &di, NULL, &c->crt_dsl));
+    li.setLayoutCount = 1; li.pSetLayouts = &c->crt_dsl;
+    li.pushConstantRangeCount = 1; li.pPushConstantRanges = &pcr;
+    CK(vkCreatePipelineLayout(c->dev, &li, NULL, &c->crt_layout));
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.maxLod = VK_LOD_CLAMP_NONE;
+    CK(vkCreateSampler(c->dev, &si, NULL, &c->crt_samp));
+
+    stg[0].module = c->crt_vs; stg[1].module = c->crt_fs;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    vp.viewportCount = 1; vp.scissorCount = 1;
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    cba.colorWriteMask = 0xF;
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
+    ri.colorAttachmentCount = 1; ri.pColorAttachmentFormats = &cf;
+    pi.pNext = &ri; pi.stageCount = 2; pi.pStages = stg;
+    pi.pVertexInputState = &vin; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
+    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms;
+    pi.pColorBlendState = &cb; pi.pDynamicState = &dy; pi.layout = c->crt_layout;
+    CK(vkCreateGraphicsPipelines(c->dev, VK_NULL_HANDLE, 1, &pi, NULL, &c->crt_pipe));
+    fprintf(stderr, "[VKR] CRT on: curv %.2f scan %.2f mask %.2f vig %.2f ab %.2f glow %.2f "
+            "bright %.2f mpitch %.1f (0 = auto) flicker %.3f noise %.2f\n",
+            c->crt_p[0], c->crt_p[1], c->crt_p[2], c->crt_p[3], c->crt_p[4],
+            c->crt_p[5], c->crt_p[6], c->crt_p[7], c->crt_p[8], c->crt_p[9]);
     return 1;
 }
 
@@ -591,6 +723,9 @@ VkrContext *vkr_create(void)
     pthread_cond_init(&c->freed, NULL);
     use_frame(c, 0);
     if (!make_layout(c)) goto fail;
+    crt_config(c);
+    if (c->crt && !make_crt(c))
+        c->crt = 0;
     return c;
 fail:
     fprintf(stderr, "[VKR] init failed\n");
@@ -624,6 +759,15 @@ static void free_target(VkrContext *c)
         vkDestroyImage(c->dev, c->down, NULL);
         vkFreeMemory(c->dev, c->down_mem, NULL);
         c->down = VK_NULL_HANDLE;
+    }
+    if (c->crt_in) {
+        vkDestroyImageView(c->dev, c->crt_in_view, NULL);
+        vkDestroyImage(c->dev, c->crt_in, NULL);
+        vkFreeMemory(c->dev, c->crt_in_mem, NULL);
+        vkDestroyImageView(c->dev, c->crt_out_view, NULL);
+        vkDestroyImage(c->dev, c->crt_out, NULL);
+        vkFreeMemory(c->dev, c->crt_out_mem, NULL);
+        c->crt_in = c->crt_out = VK_NULL_HANDLE;
     }
     c->color = c->depth = VK_NULL_HANDLE;
 }
@@ -724,6 +868,12 @@ void vkr_destroy(VkrContext *c)
     vkDestroyShaderModule(c->dev, c->vs_vsh, NULL);
     vkDestroyPipelineLayout(c->dev, c->layout, NULL);
     vkDestroyDescriptorSetLayout(c->dev, c->dsl, NULL);
+    if (c->crt_pipe) vkDestroyPipeline(c->dev, c->crt_pipe, NULL);
+    if (c->crt_samp) vkDestroySampler(c->dev, c->crt_samp, NULL);
+    if (c->crt_layout) vkDestroyPipelineLayout(c->dev, c->crt_layout, NULL);
+    if (c->crt_dsl) vkDestroyDescriptorSetLayout(c->dev, c->crt_dsl, NULL);
+    if (c->crt_vs) vkDestroyShaderModule(c->dev, c->crt_vs, NULL);
+    if (c->crt_fs) vkDestroyShaderModule(c->dev, c->crt_fs, NULL);
     for (int i = 0; i < VKR_FRAMES; i++) {
         vkDestroyBuffer(c->dev, c->fr[i].buf, NULL);
         vkFreeMemory(c->dev, c->fr[i].buf_mem, NULL);
@@ -781,6 +931,24 @@ int vkr_set_target(VkrContext *c, uint32_t w, uint32_t h, float zmax)
                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                        VK_IMAGE_ASPECT_COLOR_BIT, &c->down, &c->down_mem, &c->down_view, w, h))
         return 0;
+    if (c->crt && (c->scale != 1.0f || c->scale_x != 1.0f)) {
+        uint32_t m = c->sw > c->sh ? c->sw : c->sh;
+        for (c->crt_levels = 1; m > 1; m >>= 1)
+            c->crt_levels++;
+        if (!make_image_ex(c, VK_FORMAT_B8G8R8A8_UNORM,
+                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                           | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+                           &c->crt_in, &c->crt_in_mem, &c->crt_in_view, c->sw, c->sh, c->crt_levels)
+            || !make_image(c, VK_FORMAT_B8G8R8A8_UNORM,
+                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT, &c->crt_out, &c->crt_out_mem,
+                           &c->crt_out_view, c->sw, c->sh))
+            return 0;
+    } else if (c->crt) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[VKR] CRT needs an internal resolution above the guest's (RECOMP_RES)\n");
+    }
     for (f = 0; f < VKR_FRAMES; f++) {
         if (!make_buffer_ex(c, (VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             &c->fr[f].rb, &c->fr[f].rb_mem, &map, 1, &c->fr[f].rb_noncoherent))
@@ -1351,6 +1519,99 @@ void vkr_set_aspect(VkrContext *c, float aspect)
 uint32_t vkr_width(const VkrContext *c) { return c->w; }
 uint32_t vkr_height(const VkrContext *c) { return c->h; }
 
+/* At a flip, c->color in TRANSFER_SRC: crt_in = c->color with mips, then
+ * crt.frag into crt_out, left in TRANSFER_SRC for the read-back. */
+static void crt_pass(VkrContext *c)
+{
+    VkImageCopy ic = {0};
+    VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    VkDescriptorImageInfo dii = {c->crt_samp, c->crt_in_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    VkViewport vp;
+    VkRect2D sc = {{0, 0}, {c->sw, c->sh}};
+    struct { float rect[4], tsize[2], curv, scan, mask, vig, ab, glow, bright, time,
+             mpitch, lines, flicker, noise; } pc;
+    int32_t mw = (int32_t)c->sw, mh = (int32_t)c->sh;
+    uint32_t i;
+
+    barrier_mips(c, c->crt_in, 0, c->crt_levels,
+                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
+                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ic.srcSubresource.layerCount = 1;
+    ic.dstSubresource = ic.srcSubresource;
+    ic.extent.width = c->sw; ic.extent.height = c->sh; ic.extent.depth = 1;
+    vkCmdCopyImage(c->cmd, c->color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   c->crt_in, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    for (i = 1; i < c->crt_levels; i++) {
+        VkImageBlit bl = {0};
+        barrier_mips(c, c->crt_in, i - 1, 1,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        bl.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; bl.srcSubresource.layerCount = 1;
+        bl.srcSubresource.mipLevel = i - 1;
+        bl.dstSubresource = bl.srcSubresource; bl.dstSubresource.mipLevel = i;
+        bl.srcOffsets[1].x = mw; bl.srcOffsets[1].y = mh; bl.srcOffsets[1].z = 1;
+        mw = mw > 1 ? mw / 2 : 1; mh = mh > 1 ? mh / 2 : 1;
+        bl.dstOffsets[1].x = mw; bl.dstOffsets[1].y = mh; bl.dstOffsets[1].z = 1;
+        vkCmdBlitImage(c->cmd, c->crt_in, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       c->crt_in, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+    }
+    barrier_mips(c, c->crt_in, c->crt_levels - 1, 1,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    barrier_mips(c, c->crt_in, 0, c->crt_levels,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    barrier(c, c->crt_out, VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+    /* The picture: the 4:3 middle when pillarboxed, else the whole target. */
+    pc.rect[2] = c->squeeze_all > 0.5f ? (float)c->w * c->scale : (float)c->sw;
+    pc.rect[3] = (float)c->sh;
+    pc.rect[0] = ((float)c->sw - pc.rect[2]) * 0.5f;
+    pc.rect[1] = 0.0f;
+    pc.tsize[0] = (float)c->sw; pc.tsize[1] = (float)c->sh;
+    pc.curv = c->crt_p[0];
+    pc.scan = c->crt_p[1]; pc.mask = c->crt_p[2]; pc.vig = c->crt_p[3];
+    pc.ab = c->crt_p[4]; pc.glow = c->crt_p[5]; pc.bright = c->crt_p[6];
+    pc.time = (float)(vkr_now_ms() * 1e-3);
+    /* One RGB triad per guest pixel (auto), at least 3 target pixels: a
+     * slot under one pixel wide only aliases. */
+    pc.mpitch = c->crt_p[7] > 0.0f ? c->crt_p[7] : pc.rect[2] / (float)c->w;
+    if (pc.mpitch < 3.0f) pc.mpitch = 3.0f;
+    pc.lines = (float)c->h;          /* the guest's scanlines */
+    pc.flicker = c->crt_p[8]; pc.noise = c->crt_p[9];
+
+    ca.imageView = c->crt_out_view; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ca.clearValue.color.float32[3] = 1.0f;
+    ri.renderArea = sc; ri.layerCount = 1;
+    ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(c->cmd, &ri);
+    vp.x = pc.rect[0]; vp.y = 0.0f; vp.width = pc.rect[2]; vp.height = pc.rect[3];
+    vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+    vkCmdSetViewport(c->cmd, 0, 1, &vp);
+    vkCmdSetScissor(c->cmd, 0, 1, &sc);
+    vkCmdBindPipeline(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c->crt_pipe);
+    w.dstBinding = 0; w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &dii;
+    vkCmdPushDescriptorSet(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c->crt_layout, 0, 1, &w);
+    vkCmdPushConstants(c->cmd, c->crt_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    vkCmdDraw(c->cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(c->cmd);
+    barrier(c, c->crt_out, VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+}
+
 int vkr_flip_submit(VkrContext *c)
 {
     VkBufferImageCopy cp = {0};
@@ -1385,8 +1646,13 @@ int vkr_flip_submit(VkrContext *c)
          * for guest memory (what the title and the screenshots read). */
         VkImageBlit bl = {0};
         cp.imageExtent.width = c->sw; cp.imageExtent.height = c->sh;
-        vkCmdCopyImageToBuffer(c->cmd, c->color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               c->fr[slot].rbh, 1, &cp);
+        if (c->crt_in) {
+            crt_pass(c);
+            vkCmdCopyImageToBuffer(c->cmd, c->crt_out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   c->fr[slot].rbh, 1, &cp);
+        } else
+            vkCmdCopyImageToBuffer(c->cmd, c->color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   c->fr[slot].rbh, 1, &cp);
         barrier(c, c->down, VK_IMAGE_ASPECT_COLOR_BIT,
                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,

@@ -6567,10 +6567,10 @@ index 08bae4b..dc7c22c 100644
  #endif
 diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
 new file mode 100644
-index 0000000..db3043e
+index 0000000..748ee10
 --- /dev/null
 +++ b/src/video/fb_present_sdl.c
-@@ -0,0 +1,375 @@
+@@ -0,0 +1,437 @@
 +/**
 + * POSIX counterpart of fb_present.c: show the guest framebuffer in an SDL2
 + * window. Same contract (RECOMP_FB_WINDOW, flip-time copy, BMP dump, snap
@@ -6643,13 +6643,36 @@ index 0000000..db3043e
 +    }
 +}
 +
-+/* Called by the pushbuffer executor when the title flips. */
-+/* A GPU backend's own full-resolution frame: not used by the SDL window yet
-+ * (it keeps showing the guest surface). */
++/* A GPU backend's own full-resolution frame (Vulkan, RECOMP_RES): shown
++ * instead of the guest surface while it keeps coming. */
++static pthread_mutex_t s_hi_lock = PTHREAD_MUTEX_INITIALIZER;
++static uint32_t *s_hi;
++static uint32_t  s_hi_w, s_hi_h;
++static int       s_hi_new;
++static double    s_hi_at;
++
++static double now_ms(void);
++
 +void xbox_FramebufferPublishImage(const uint32_t *px, uint32_t w, uint32_t h)
 +{
-+    (void)px; (void)w; (void)h;
++    if (!px || !w || !h)
++        return;
++    pthread_mutex_lock(&s_hi_lock);
++    if (w != s_hi_w || h != s_hi_h) {
++        free(s_hi);
++        s_hi = (uint32_t *)malloc((size_t)w * h * 4);
++        s_hi_w = s_hi ? w : 0;
++        s_hi_h = s_hi ? h : 0;
++    }
++    if (s_hi) {
++        memcpy(s_hi, px, (size_t)w * h * 4);
++        s_hi_new = 1;
++        s_hi_at = now_ms();
++    }
++    pthread_mutex_unlock(&s_hi_lock);
 +}
++
++/* Called by the pushbuffer executor when the title flips. */
 +
 +void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 +{
@@ -6842,7 +6865,8 @@ index 0000000..db3043e
 +{
 +    SDL_Window *win;
 +    SDL_Renderer *ren;
-+    SDL_Texture *tex;
++    SDL_Texture *tex, *hi_tex = NULL;
++    uint32_t *hi_rgb = NULL, hi_w = 0, hi_h = 0;
 +    double t0 = 0;
 +    int f0 = 0;
 +
@@ -6896,6 +6920,42 @@ index 0000000..db3043e
 +            __atomic_store_n(&s_client_w, cw, __ATOMIC_RELAXED);
 +            __atomic_store_n(&s_client_h, ch, __ATOMIC_RELAXED);
 +        }
++        pthread_mutex_lock(&s_hi_lock);
++        if (s_hi && now_ms() - s_hi_at < 250.0) {
++            int fresh = s_hi_new;
++            if (s_hi_w != hi_w || s_hi_h != hi_h) {
++                if (hi_tex) SDL_DestroyTexture(hi_tex);
++                free(hi_rgb);
++                hi_w = s_hi_w; hi_h = s_hi_h;
++                hi_rgb = (uint32_t *)malloc((size_t)hi_w * hi_h * 4);
++                hi_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
++                                           SDL_TEXTUREACCESS_STREAMING, (int)hi_w, (int)hi_h);
++                SDL_RenderSetLogicalSize(ren, (int)hi_w, (int)hi_h);
++                fresh = 1;
++            }
++            if (fresh && hi_rgb)
++                memcpy(hi_rgb, s_hi, (size_t)hi_w * hi_h * 4);
++            s_hi_new = 0;
++            pthread_mutex_unlock(&s_hi_lock);
++            if (hi_tex && hi_rgb) {
++                if (fresh) {
++                    xbox_FramebufferApplyGamma(hi_rgb, (size_t)hi_w * hi_h);
++                    SDL_UpdateTexture(hi_tex, NULL, hi_rgb, (int)(hi_w * 4));
++                }
++                SDL_RenderClear(ren);
++                SDL_RenderCopy(ren, hi_tex, NULL, NULL);
++                SDL_RenderPresent(ren);
++                goto shown;
++            }
++        } else {
++            pthread_mutex_unlock(&s_hi_lock);
++            if (hi_tex) {
++                SDL_DestroyTexture(hi_tex);
++                hi_tex = NULL;
++                hi_w = hi_h = 0;
++                SDL_RenderSetLogicalSize(ren, (int)s_fb_width, (int)s_fb_height);
++            }
++        }
 +        idx = __atomic_load_n(&s_present_idx, __ATOMIC_ACQUIRE);
 +        if (idx >= 0 && s_present[idx])
 +            memcpy(s_rgb, s_present[idx], (size_t)s_fb_width * s_fb_height * 4);
@@ -6912,7 +6972,7 @@ index 0000000..db3043e
 +        SDL_RenderClear(ren);
 +        SDL_RenderCopy(ren, tex, NULL, NULL);
 +        SDL_RenderPresent(ren);
-+
++shown:
 +        {
 +            double now = now_ms();
 +            if (now - t0 >= 1000.0) {
@@ -6926,6 +6986,8 @@ index 0000000..db3043e
 +        }
 +        snap_trigger_poll();
 +    }
++    if (hi_tex) SDL_DestroyTexture(hi_tex);
++    free(hi_rgb);
 +    SDL_DestroyTexture(tex);
 +    SDL_DestroyRenderer(ren);
 +    SDL_DestroyWindow(win);

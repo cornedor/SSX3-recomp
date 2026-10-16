@@ -52,6 +52,8 @@ vkr_shader(vert)
 vkr_shader(frag)
 vkr_shader_variant(frag xbox xbox_frag_wdepth W_DEPTH)
 vkr_shader(vert xbox_vsh)
+vkr_shader(vert crt)
+vkr_shader(frag crt)
 
 add_library(vkr STATIC vkr.c ${VKR_HEADERS})
 # vkr_backend.c is added by the game build (needs the toolkit headers).

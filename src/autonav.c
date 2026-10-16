@@ -49,6 +49,9 @@ extern int xbox_PadInject(const char *line);
 extern volatile uint32_t g_ssx3_ui_screen_vt, g_ssx3_ui_screen_id, g_ssx3_ui_screen_ptr;
 
 static int s_rider, s_peak, s_mode, s_event, s_brief;
+/* Counts briefings passed: RECOMP_AB=<dir>,b<ms> times its shots from
+ * the first one (vkr_backend.c), so runs line up on the race start. */
+volatile int ssx3_autonav_briefed;
 static DWORD s_t0;
 /* Set when autonav reaches the briefing (RECOMP_VKR_TRACE_BRIEF times from it). */
 volatile int g_ssx3_at_briefing;
@@ -138,6 +141,7 @@ static DWORD WINAPI autonav_thread(LPVOID unused)
                     g_ssx3_at_briefing = 1;
                     if (!s_brief)
                         press("a:200", "briefing");
+                    ssx3_autonav_briefed++;
                     /* Re-arm: back in the frontend after this race (quit,
                      * results), drive the menus to the next one. */
                     loading_seen = skipped = 0;

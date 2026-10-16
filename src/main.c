@@ -870,6 +870,40 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             _putenv_s("RECOMP_ASPECT", "");
         }
     }
+    /*   RECOMP_REMASTER (default 1; 0 = the plain look): the modernised
+     *   look in one switch. Every part keeps its own flag -- set it to
+     *   override, 0 = that part off:
+     *     RECOMP_MSAA=4         multisampled edges
+     *     RECOMP_A2C=1          anti-aliased alpha-tested edges (trees, fences)
+     *     RECOMP_SHADOW_SOFT=1.5  soft rider shadows (GPU shadow maps,
+     *                           RECOMP_VKR_GPU_RT, x RECOMP_VKR_RT_SCALE=4)
+     *     RECOMP_SHARPEN=0.4    contrast-adaptive sharpening
+     *     RECOMP_BLOOM=0.35     light spill above RECOMP_BLOOM_THRESH=0.8
+     *     RECOMP_VIBRANCE=0.15  RECOMP_CONTRAST=0.1  gentle grade
+     *     RECOMP_DEBAND=1       no banding in gradients
+     *     RECOMP_DEBLOCK=32     DXT block seams smoothed (texture decode)
+     *     RECOMP_AO=0.8         ambient occlusion from the depth buffer
+     *     RECOMP_HAZE=0.35      distance fades towards the event's fog colour
+     *     RECOMP_SHAFTS=1       light shafts when the sun is on screen
+     *     RECOMP_RIM=0.2        sun-side rim light on near silhouettes (riders)
+     *   (scene pass: in game only; finer knobs in RECOMP_SCENE_PARAMS, vkr.c)
+     *   Not in it: RECOMP_MBLUR (camera motion blur, 1 = full shutter),
+     *   RECOMP_TEX_BICUBIC (Catmull-Rom for magnified textures),
+     *   RECOMP_VIGNETTE, RECOMP_CRT. */
+    {
+        const char *r = getenv("RECOMP_REMASTER");
+        if (!r || *r != '0') {
+            static const char *const def[][2] = {
+                {"RECOMP_MSAA", "4"}, {"RECOMP_A2C", "1"}, {"RECOMP_SHADOW_SOFT", "1.5"},
+                {"RECOMP_SHARPEN", "0.4"}, {"RECOMP_BLOOM", "0.35"}, {"RECOMP_VIBRANCE", "0.15"},
+                {"RECOMP_CONTRAST", "0.1"}, {"RECOMP_DEBAND", "1"}, {"RECOMP_DEBLOCK", "32"},
+                {"RECOMP_AO", "0.8"}, {"RECOMP_HAZE", "0.35"}, {"RECOMP_SHAFTS", "1"}, {"RECOMP_RIM", "0.2"}};
+            size_t i;
+            for (i = 0; i < sizeof def / sizeof def[0]; i++)
+                if (!getenv(def[i][0]))
+                    _putenv_s(def[i][0], def[i][1]);
+        }
+    }
 #ifdef _WIN32
     /* RECOMP_USB_PADS: as many emulated pads as XInput controllers are
      * plugged in at start (1..4), so a second controller makes Multi Play

@@ -59,6 +59,42 @@ static void stats_tick(void)
 #include "vkr_backend.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+
+/* RECOMP_AB=<dir>,<start>[,<pairs>[,<interval ms>]]: A/B pairs at full
+ * resolution, <dir>/ab<k>_on.ppm (as configured) and ab<k>_off.ppm (the
+ * per-frame remaster features off: vkr_ab_off), a few frames apart; start is
+ * ms after the first flip, or "b<ms>" after the first race briefing (the
+ * race start: the same camera in every run). RECOMP_AB_KEEP=1: both shots
+ * as configured (to compare two runs). ab_flip asks, the flip thread writes
+ * the next frame. */
+static char s_ab_path[512];
+static volatile int s_ab_req;
+
+static void ab_capture(const uint8_t *bgra, uint32_t w, uint32_t h)
+{
+    FILE *f;
+    uint8_t *line;
+    uint32_t x, y;
+    if (!__atomic_load_n(&s_ab_req, __ATOMIC_ACQUIRE))
+        return;
+    f = fopen(s_ab_path, "wb");
+    line = (uint8_t *)malloc((size_t)w * 3);
+    if (f && line) {
+        fprintf(f, "P6\n%u %u\n255\n", w, h);
+        for (y = 0; y < h; y++) {
+            const uint8_t *src = bgra + (size_t)y * w * 4;
+            for (x = 0; x < w; x++) {
+                line[x * 3] = src[x * 4 + 2]; line[x * 3 + 1] = src[x * 4 + 1];
+                line[x * 3 + 2] = src[x * 4];
+            }
+            fwrite(line, 1, (size_t)w * 3, f);
+        }
+        fprintf(stderr, "[AB] wrote %s (%ux%u)\n", s_ab_path, w, h);
+    }
+    if (f) fclose(f);
+    free(line);
+    __atomic_store_n(&s_ab_req, 0, __ATOMIC_RELEASE);
+}
 extern void xbox_FramebufferPublishImage(const uint32_t *px, uint32_t w, uint32_t h);
 extern int ssx3_WidescreenNow(void);
 extern float ssx3_Aspect(void);
@@ -125,8 +161,10 @@ static void *flip_thread(void *unused)
                        px + (size_t)y * j.w * 4, (size_t)j.w * 4);
             /* Higher internal resolution: the window shows the full image. */
             full = vkr_frame_pixels_full(s_vk, j.slot, &fw, &fh);
-            if (full)
+            if (full) {
+                ab_capture(full, fw, fh);
                 xbox_FramebufferPublishImage((const uint32_t *)full, fw, fh);
+            }
         }
         pthread_mutex_lock(&s_job_lock);
         s_job_head = (s_job_head + 1) % 4;
@@ -181,6 +219,15 @@ static void note_rt(uint32_t off)
         s_rt[s_nrt++] = off;
 }
 
+static int is_rt(uint32_t off)
+{
+    int i;
+    for (i = 0; i < s_nrt; i++)
+        if (s_rt[i] == off)
+            return 1;
+    return 0;
+}
+
 static int samples_rt(const VkrDrawState *st)
 {
     int k, i;
@@ -227,6 +274,66 @@ static int is_main(const Nv2aTarget *t)
         fprintf(stderr, "[VKR] target %ux%u zmax %X\n", s_w, s_h, s_zmax);
     }
     vkr_set_scissor(s_vk, t->x, t->y, t->width, t->height);
+    return 1;
+}
+
+/* RECOMP_VKR_GPU_RT (default on; 0 = the software rasteriser draws them into
+ * guest memory as before): swizzled 32-bit render targets -- SSX 3's rider
+ * shadow maps -- are drawn on the GPU at RECOMP_VKR_RT_SCALE times their size
+ * and sampled from there. The surface's size is the next power of two of
+ * the clip's far corner (the maps are 128x128, clip 2,2 124x124). */
+static int s_gpu_rt = -1;
+
+static uint32_t pow2_at_least(uint32_t v)
+{
+    uint32_t p = 1;
+    while (p < v && p < 4096)
+        p <<= 1;
+    return p;
+}
+
+static int gpu_rt_on(void)
+{
+    if (s_gpu_rt < 0) {
+        const char *e = getenv("RECOMP_VKR_GPU_RT");
+        s_gpu_rt = !(e && *e == '0');
+    }
+    return s_gpu_rt;
+}
+
+/* Point the renderer at t: the main target or a GPU render target. 0: not
+ * ours (the software rasteriser draws it). */
+static unsigned s_frame_draw_no, s_frame_draws_last;   /* main-target draws per frame (RECOMP_SCENE_TRACE) */
+
+static int select_target(const Nv2aTarget *t)
+{
+    /* The title clears its shadow maps through a pitch-linear surface at
+     * the same address (format 0x07070128): a known render target is that
+     * target whatever the layout says. */
+    if ((t->swizzled || is_rt(t->color_offset)) && t->bpp == 4 && gpu_rt_on()) {
+        uint32_t w = pow2_at_least(t->x + t->width), h = pow2_at_least(t->y + t->height);
+        note_rt(t->color_offset);
+        if (!vkr_rt_bind(s_vk, t->color_offset, w, h, (float)(t->zmax ? t->zmax : 0xFFFF)))
+            return 0;
+        vkr_set_scissor(s_vk, t->x, t->y, t->width, t->height);
+        {
+            static int dbg = -1, n;
+            if (dbg < 0) dbg = getenv("RECOMP_RT_DEBUG") != NULL;
+            if (dbg && (n < 12 || !t->swizzled) && n < 40) {
+                n++;
+                fprintf(stderr, "[RTDBG] %s into %08X clip %u,%u %ux%u blend %d %X/%X mask %08X alpha %d/%X/%u"
+                        " depth %d/%d final %08X %08X rc %u\n", t->swizzled ? "draw" : "LINEAR", t->color_offset, t->x, t->y, t->width,
+                        t->height, t->blend_enable, t->blend_sfactor, t->blend_dfactor, t->color_mask,
+                        t->alpha_test, t->alpha_func, t->alpha_ref, t->depth_test, t->depth_write,
+                        t->rc.final0, t->rc.final1, t->rc_seen);
+            }
+        }
+        return 1;
+    }
+    vkr_use_main(s_vk);
+    if (!is_main(t))
+        return 0;
+    s_frame_draw_no++;
     return 1;
 }
 
@@ -289,13 +396,53 @@ static void fill_state(const Nv2aTarget *t, VkrDrawState *st)
 }
 
 
-static int is_rt(uint32_t off)
+/* RECOMP_DEBLOCK=<threshold, 0..255; 0 = off>: DXT textures are made of
+ * 4x4 blocks with four colours each; magnified (the mountain backdrops are
+ * stretched 2-3x at 1080p) the block seams show as a grid. Across every
+ * block border, a step smaller than the threshold -- with smooth texels on
+ * both sides -- is a seam, not an edge, and is smoothed over the two texels
+ * each side; larger steps (real edges) stay sharp. Colour only; the alpha
+ * of cut-out textures is untouched. Once per decoded texture. */
+static int s_deblock = -1;
+
+static void deblock_line(uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d, int thr)
 {
-    int i;
-    for (i = 0; i < s_nrt; i++)
-        if (s_rt[i] == off)
-            return 1;
-    return 0;
+    uint32_t na = *a, nb = *b, nc = *c, nd = *d;
+    int sh;
+    for (sh = 0; sh < 24; sh += 8) {
+        int p1 = (int)(*a >> sh) & 255, p0 = (int)(*b >> sh) & 255;
+        int q0 = (int)(*c >> sh) & 255, q1 = (int)(*d >> sh) & 255;
+        int step = q0 - p0;
+        if (abs(step) >= thr || abs(p1 - p0) * 2 >= thr || abs(q1 - q0) * 2 >= thr)
+            return;                     /* an edge (in any channel): keep the texels */
+        (void)p1; (void)q1;
+    }
+    for (sh = 0; sh < 24; sh += 8) {
+        int p1 = (int)(*a >> sh) & 255, p0 = (int)(*b >> sh) & 255;
+        int q0 = (int)(*c >> sh) & 255, q1 = (int)(*d >> sh) & 255;
+        /* a ramp across the four: p1 p0 | q0 q1 */
+        int np0 = (p1 + 2 * p0 + q0 + 2) >> 2, nq0 = (p0 + 2 * q0 + q1 + 2) >> 2;
+        int np1 = (3 * p1 + p0 + 2) >> 2, nq1 = (3 * q1 + q0 + 2) >> 2;
+        na = (na & ~(255u << sh)) | (uint32_t)np1 << sh;
+        nb = (nb & ~(255u << sh)) | (uint32_t)np0 << sh;
+        nc = (nc & ~(255u << sh)) | (uint32_t)nq0 << sh;
+        nd = (nd & ~(255u << sh)) | (uint32_t)nq1 << sh;
+    }
+    *a = na; *b = nb; *c = nc; *d = nd;
+}
+
+static void deblock(uint32_t *px, uint32_t w, uint32_t h, int thr)
+{
+    uint32_t x, y;
+    for (y = 0; y < h; y++)
+        for (x = 4; x + 1 < w; x += 4) {
+            uint32_t *r = px + (size_t)y * w;
+            deblock_line(&r[x - 2], &r[x - 1], &r[x], &r[x + 1], thr);
+        }
+    for (y = 4; y + 1 < h; y += 4)
+        for (x = 0; x < w; x++)
+            deblock_line(&px[(size_t)(y - 2) * w + x], &px[(size_t)(y - 1) * w + x],
+                         &px[(size_t)y * w + x], &px[(size_t)(y + 1) * w + x], thr);
 }
 
 /* Bind the texture stages the combiners use. */
@@ -341,7 +488,32 @@ static void bind_textures(VkrDrawState *st)
             continue;
         if (!nv2a_exec_tex_info(k, &ti))
             continue;
-        tex = vkr_tex_find(s_vk, ti.hash);
+        tex = NULL;
+        if (gpu_rt_on() && is_rt(ti.offset) && !ti.cube) {
+            tex = vkr_rt_texture(s_vk, ti.offset, ti.width, ti.height);
+            {
+                /* RECOMP_RT_DEBUG=1: how the title samples its render
+                 * targets (first few draws) */
+                static int dbg = -1, n;
+                if (dbg < 0) dbg = getenv("RECOMP_RT_DEBUG") != NULL;
+                if (dbg && n < 6) {
+                    int i;
+                    n++;
+                    fprintf(stderr, "[RTDBG] stage %d off %08X fmt %02X %ux%u addr %u/%u lin %d prog %05X"
+                            " rc %u ctl %08X final %08X %08X alpha %X/%u blend %d %X/%X mask %X\n",
+                            k, ti.offset, ti.format, ti.width, ti.height, ti.addr_u, ti.addr_v,
+                            ti.linear_filter, st->u.stage_program, st->u.rc_seen, st->u.control,
+                            st->u.final0, st->u.final1, st->alpha_func, st->alpha_ref, st->blend_enable,
+                            st->blend_src, st->blend_dst, st->write_mask);
+                    for (i = 0; i < (int)(st->u.control & 0xFF) && i < 8; i++)
+                        fprintf(stderr, "[RTDBG]   rc%d icw %08X ocw %08X aicw %08X aocw %08X f0 %08X f1 %08X\n",
+                                i, st->u.color_icw[i], st->u.color_ocw[i], st->u.alpha_icw[i],
+                                st->u.alpha_ocw[i], st->u.factor0[i], st->u.factor1[i]);
+                }
+            }
+        }
+        if (!tex)
+            tex = vkr_tex_find(s_vk, ti.hash);
         if (s_stats) s_t[1] += now_ms() - t0;
         if (!tex) {
             double t1 = s_stats ? now_ms() : 0;
@@ -349,6 +521,13 @@ static void bind_textures(VkrDrawState *st)
             uint32_t *px = (uint32_t *)malloc((size_t)ti.width * rows * 4);
             int rt = is_rt(ti.offset), j;
             if (px && nv2a_exec_tex_decode(k, px)) {
+                if (s_deblock < 0) {
+                    const char *e = getenv("RECOMP_DEBLOCK");
+                    s_deblock = e ? atoi(e) : 0;
+                }
+                if (s_deblock > 0 && !rt && !ti.cube && ti.width >= 16 && ti.height >= 16
+                    && (ti.format == 0x0C || ti.format == 0x0E || ti.format == 0x0F))
+                    deblock(px, ti.width, ti.height, s_deblock);
                 /* A render target redrawn every frame: one texture per
                  * address, updated in place, not a new one per frame. */
                 VkrTex *old = NULL;
@@ -360,7 +539,7 @@ static void bind_textures(VkrDrawState *st)
                 if (old && vkr_tex_update(s_vk, old, ti.hash, px))
                     tex = old;
                 else {
-                    tex = vkr_tex_create(s_vk, ti.hash, ti.width, rows, px);
+                    tex = vkr_tex_create_ex(s_vk, ti.hash, ti.width, rows, px, !rt && !ti.cube);
                     if (tex && rt && s_nrt_tex < 16) {
                         s_rt_tex[s_nrt_tex].off = ti.offset; s_rt_tex[s_nrt_tex].w = ti.width;
                         s_rt_tex[s_nrt_tex].h = ti.height; s_rt_tex[s_nrt_tex].tex = tex;
@@ -638,6 +817,373 @@ static void primlog(const VkrDrawState *st, uint32_t n, int gpu_vsh)
     fflush(stderr);
 }
 
+extern volatile int ssx3_autonav_briefed;
+
+/* At a flip: RECOMP_AB. */
+static void ab_flip(void)
+{
+    static int init, pairs = 3, k, phase, wait, from_brief;
+    static double start, interval = 4000, t0;
+    static char dir[400];
+    if (!init) {
+        const char *e = getenv("RECOMP_AB"), *c;
+        size_t n;
+        init = 1;
+        t0 = now_ms();                  /* the first flip */
+        if (!e)
+            return;
+        c = strchr(e, ',');
+        n = c ? (size_t)(c - e) : strlen(e);
+        if (n >= sizeof dir) n = sizeof dir - 1;
+        memcpy(dir, e, n);
+        /* "b<ms>": after the first briefing autonav passes (the race
+         * start: the same camera in every run) */
+        if (c && c[1] == 'b') {
+            from_brief = 1;
+            start = atof(c + 2);
+        } else
+            start = c ? atof(c + 1) : 45000;
+        if (c && (c = strchr(c + 1, ','))) {
+            pairs = atoi(c + 1);
+            if ((c = strchr(c + 1, ',')))
+                interval = atof(c + 1);
+        }
+    }
+    if (!dir[0] || k >= pairs || s_ab_req)
+        return;
+    if (from_brief) {
+        if (!ssx3_autonav_briefed)
+            return;
+        if (from_brief == 1) {
+            from_brief = 2;
+            t0 = now_ms();
+        }
+    }
+    if (wait > 0) {
+        wait--;
+        return;
+    }
+    /* capture on, features off, capture off, features on: 6 flips apart,
+     * more than the frames in flight */
+    if (phase == 0 && now_ms() - t0 >= start + k * interval) {
+        snprintf(s_ab_path, sizeof s_ab_path, "%s/ab%d_on.ppm", dir, k);
+        __atomic_store_n(&s_ab_req, 1, __ATOMIC_RELEASE);
+        phase = 1; wait = 6;
+    } else if (phase == 1) {
+        vkr_ab_off(s_vk, !getenv("RECOMP_AB_KEEP"));     /* KEEP: two frames, both on */
+        phase = 2; wait = 6;
+    } else if (phase == 2) {
+        snprintf(s_ab_path, sizeof s_ab_path, "%s/ab%d_off.ppm", dir, k);
+        __atomic_store_n(&s_ab_req, 1, __ATOMIC_RELEASE);
+        phase = 3; wait = 6;
+    } else if (phase == 3) {
+        phase = 0; k++;
+        vkr_ab_off(s_vk, 0);
+    }
+}
+
+
+/* The scene camera (RECOMP_AO / _HAZE / _SHAFTS / _RIM / _MBLUR): per frame,
+ * the map from world space to what the terrain's vertex program outputs --
+ * pixels x, y, depth-buffer units z, clip w -- measured by running the
+ * program on the CPU at the origin and the three unit points: (x w, y w,
+ * z w, w) is linear in the world position, so four runs give the 4x4
+ * matrix. Taken from the first draw of a terrain program (RECOMP_SCENE_VSH,
+ * default E4F2B8D0, the slopes) each frame; frames without one (menus) get
+ * no scene effects. The sun is the program's c[17] (the light direction), the
+ * haze colour the draw's fog colour. */
+static struct {
+    int valid;                  /* this frame */
+    double m[4][4];             /* rows: x w, y w, z w, w */
+    float sun[3], fog[3];
+    double eye[3];
+} s_cam;
+
+static int cam_program(uint32_t hash)
+{
+    static int n = -1;
+    static uint32_t want[8];
+    int i;
+    if (n < 0) {
+        const char *l = getenv("RECOMP_SCENE_VSH");
+        if (!l) l = "E4F2B8D0";
+        n = 0;
+        while (*l && n < 8) {
+            char *end;
+            uint32_t v = (uint32_t)strtoul(l, &end, 16);
+            if (end == l) break;
+            want[n++] = v;
+            l = *end == ',' ? end + 1 : end;
+        }
+    }
+    for (i = 0; i < n; i++)
+        if (want[i] == hash)
+            return 1;
+    return 0;
+}
+
+static void scene_camera(const VkrDrawState *st, const float *in, const Nv2aVshProgram *p)
+{
+    static const double pts[5][3] = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {3, -2, 5}};
+    float vin[NV2A_VSH_INPUTS][4];
+    double out[5][4];
+    int a, k, r;
+    if (s_cam.valid || !cam_program(p->hash) || p->in_slot[0] == 0xFF)
+        return;
+    memset(vin, 0, sizeof vin);
+    for (a = 0; a < NV2A_VSH_INPUTS; a++)
+        if (p->in_slot[a] != 0xFF)
+            memcpy(vin[a], in + p->in_slot[a] * 4, sizeof vin[a]);
+    for (k = 0; k < 5; k++) {
+        Nv2aVshOutput o;
+        /* around the first vertex: the unit offsets stay well conditioned */
+        vin[0][0] = (float)(in[p->in_slot[0] * 4 + 0] + pts[k][0]);
+        vin[0][1] = (float)(in[p->in_slot[0] * 4 + 1] + pts[k][1]);
+        vin[0][2] = (float)(in[p->in_slot[0] * 4 + 2] + pts[k][2]);
+        vin[0][3] = 1.0f;
+        if (!nv2a_vsh_run((const float (*)[4])vin, &o))
+            return;
+        out[k][0] = (double)o.pos[0] * o.pos[3]; out[k][1] = (double)o.pos[1] * o.pos[3];
+        out[k][2] = (double)o.pos[2] * o.pos[3]; out[k][3] = o.pos[3];
+    }
+    {
+        double base[3] = {in[p->in_slot[0] * 4], in[p->in_slot[0] * 4 + 1], in[p->in_slot[0] * 4 + 2]};
+        for (r = 0; r < 4; r++) {
+            double c = out[0][r];
+            s_cam.m[r][0] = out[1][r] - c; s_cam.m[r][1] = out[2][r] - c; s_cam.m[r][2] = out[3][r] - c;
+            /* constant term at the world origin, not at the first vertex */
+            s_cam.m[r][3] = c - s_cam.m[r][0] * base[0] - s_cam.m[r][1] * base[1] - s_cam.m[r][2] * base[2];
+        }
+        {
+            /* RECOMP_SCENE_TRACE=1: the fit's error at a fifth point, the
+             * eye's distance to the first vertex, once a second */
+            static int tr = -1;
+            static double last;
+            if (tr < 0) tr = getenv("RECOMP_SCENE_TRACE") != NULL;
+            if (tr && now_ms() - last > 1000.0) {
+                double e = 0, pw[3] = {base[0] + 3, base[1] - 2, base[2] + 5};
+                last = now_ms();
+                for (r = 0; r < 4; r++) {
+                    double v = s_cam.m[r][0] * pw[0] + s_cam.m[r][1] * pw[1] + s_cam.m[r][2] * pw[2] + s_cam.m[r][3];
+                    e += fabs(v - out[4][r]) / (fabs(out[4][r]) + 1e-6);
+                }
+                fprintf(stderr, "[SCENE] fit error %.2e, v0 %.1f %.1f %.1f -> px %.1f %.1f z %.1f w %.3f,"
+                        " sun %.3f %.3f %.3f fog %.2f %.2f %.2f\n", e, base[0], base[1], base[2],
+                        out[0][0] / out[0][3], out[0][1] / out[0][3], out[0][2] / out[0][3], out[0][3],
+                        p->consts[17][0], p->consts[17][1], p->consts[17][2],
+                        st->u.fog_color[0], st->u.fog_color[1], st->u.fog_color[2]);
+            }
+        }
+    }
+    memcpy(s_cam.sun, p->consts[17], sizeof s_cam.sun);
+    memcpy(s_cam.fog, st->u.fog_color, sizeof s_cam.fog);
+    {
+        /* the eye: where x w = y w = w = 0 (rows 0, 1, 3) */
+        double a[3][4], f;
+        int i, j, q;
+        for (i = 0; i < 3; i++) {
+            int row = i < 2 ? i : 3;
+            for (j = 0; j < 3; j++) a[i][j] = s_cam.m[row][j];
+            a[i][3] = -s_cam.m[row][3];
+        }
+        for (i = 0; i < 3; i++) {             /* Gauss-Jordan, partial pivot */
+            int pv = i;
+            for (q = i + 1; q < 3; q++) if (fabs(a[q][i]) > fabs(a[pv][i])) pv = q;
+            for (j = 0; j < 4; j++) { double t = a[i][j]; a[i][j] = a[pv][j]; a[pv][j] = t; }
+            if (fabs(a[i][i]) < 1e-30) return;
+            for (q = 0; q < 3; q++) {
+                if (q == i) continue;
+                f = a[q][i] / a[i][i];
+                for (j = 0; j < 4; j++) a[q][j] -= f * a[i][j];
+            }
+        }
+        for (i = 0; i < 3; i++) s_cam.eye[i] = a[i][3] / a[i][i];
+    }
+    {
+        static int tr = -1;
+        static double last;
+        if (tr < 0) tr = getenv("RECOMP_SCENE_TRACE") != NULL;
+        if (tr && now_ms() - last > 500.0) {
+            last = now_ms();
+            fprintf(stderr, "[SCENE] eye %.1f %.1f %.1f\n", s_cam.eye[0], s_cam.eye[1], s_cam.eye[2]);
+        }
+    }
+    s_cam.valid = 1;
+}
+
+/* 4x4 inverse (Gauss-Jordan, partial pivoting); 0 if singular. */
+static int inv4(double a[4][4], double r[4][4])
+{
+    double m[4][8];
+    int i, j, k;
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 8; j++)
+            m[i][j] = j < 4 ? a[i][j] : (j - 4 == i);
+    for (i = 0; i < 4; i++) {
+        int p = i;
+        for (k = i + 1; k < 4; k++) if (fabs(m[k][i]) > fabs(m[p][i])) p = k;
+        if (fabs(m[p][i]) < 1e-300) return 0;
+        for (j = 0; j < 8; j++) { double t = m[i][j]; m[i][j] = m[p][j]; m[p][j] = t; }
+        for (k = 0; k < 4; k++) {
+            double f;
+            if (k == i) continue;
+            f = m[k][i] / m[i][i];
+            for (j = 0; j < 8; j++) m[k][j] -= f * m[i][j];
+        }
+    }
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 4; j++)
+            r[i][j] = m[i][j + 4] / m[i][i];
+    return 1;
+}
+
+/* M [P, 1] -> guest pixel; 0 if behind the eye. */
+static int cam_project(double m[4][4], const double p[3], double *x, double *y)
+{
+    double v[4];
+    int r;
+    for (r = 0; r < 4; r++)
+        v[r] = m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3];
+    if (v[3] <= 1e-6)
+        return 0;
+    *x = v[0] / v[3]; *y = v[1] / v[3];
+    return 1;
+}
+
+/* At a flip: the frame's camera to the renderer (vkr_scene_set), positions
+ * relative to the eye, depth shifted by zmax (scene_common.glsl). */
+static int s_scene_sent;            /* vkr_scene_set done this frame */
+
+static void scene_flip(void)
+{
+    static double prev[4][4];
+    static int have_prev;
+    double me[4][4], inv[4][4], to_sun[3], len, sx, sy;
+    VkrScene sc;
+    int r, k;
+    if (!s_cam.valid) {
+        have_prev = 0;
+        return;
+    }
+    if (s_scene_sent)
+        return;
+    s_scene_sent = 1;
+    memset(&sc, 0, sizeof sc);
+    for (r = 0; r < 4; r++) {
+        for (k = 0; k < 3; k++) me[r][k] = s_cam.m[r][k];
+        me[r][3] = s_cam.m[r][0] * s_cam.eye[0] + s_cam.m[r][1] * s_cam.eye[1]
+                 + s_cam.m[r][2] * s_cam.eye[2] + s_cam.m[r][3];
+    }
+    if (!inv4(me, inv))
+        return;
+    /* input (gx, gy, d - zmax, 1): column 3 takes zmax times column 2 */
+    for (r = 0; r < 4; r++)
+        inv[r][3] += inv[r][2] * (double)s_zmax;
+    for (r = 0; r < 4; r++)
+        for (k = 0; k < 4; k++)
+            sc.inv_m[k * 4 + r] = (float)inv[r][k];
+    /* last frame's camera on this frame's eye-relative positions */
+    for (r = 0; r < 4; r++) {
+        double (*pm)[4] = have_prev ? prev : me;
+        for (k = 0; k < 3; k++) sc.prev_m[k * 4 + r] = (float)pm[r][k];
+        sc.prev_m[12 + r] = (float)(pm[r][0] * s_cam.eye[0] + pm[r][1] * s_cam.eye[1]
+                                    + pm[r][2] * s_cam.eye[2] + pm[r][3]);
+    }
+    memcpy(prev, s_cam.m, sizeof prev);
+    have_prev = 1;
+
+    /* c[17] is the light's direction (Y is up and it points down): the sun
+     * is the other way */
+    len = sqrt((double)s_cam.sun[0] * s_cam.sun[0] + (double)s_cam.sun[1] * s_cam.sun[1]
+               + (double)s_cam.sun[2] * s_cam.sun[2]);
+    if (len < 1e-6)
+        return;
+    for (k = 0; k < 3; k++) to_sun[k] = -s_cam.sun[k] / len;
+    for (k = 0; k < 3; k++) sc.sun[k] = (float)to_sun[k];
+    {
+        double far[3];
+        for (k = 0; k < 3; k++) far[k] = s_cam.eye[k] + to_sun[k] * 1e7;
+        if (cam_project(s_cam.m, far, &sx, &sy)) {
+            double ox = sx < 0 ? -sx : sx > s_w ? sx - s_w : 0;
+            double oy = sy < 0 ? -sy : sy > s_h ? sy - s_h : 0;
+            double out = sqrt(ox * ox + oy * oy) / (0.5 * s_w);
+            sc.sun[3] = (float)(out >= 1.0 ? 0.0 : 1.0 - out * out * (3.0 - 2.0 * out));
+            sc.sun_px[0] = (float)sx; sc.sun_px[1] = (float)sy;
+        }
+    }
+    {
+        /* towards the sun on screen, around a point ahead of the eye */
+        double fwd[3], fl, a[3], b[3], ax, ay, bx, by;
+        for (k = 0; k < 3; k++) fwd[k] = s_cam.m[3][k];
+        fl = sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+        if (fl > 0) {
+            for (k = 0; k < 3; k++) {
+                a[k] = s_cam.eye[k] + fwd[k] / fl * 500.0;
+                b[k] = a[k] + to_sun[k] * 50.0;
+            }
+            if (cam_project(s_cam.m, a, &ax, &ay) && cam_project(s_cam.m, b, &bx, &by)) {
+                double dx = bx - ax, dy = by - ay, dl = sqrt(dx * dx + dy * dy);
+                if (dl > 1e-6) { sc.sun_px[2] = (float)(dx / dl); sc.sun_px[3] = (float)(dy / dl); }
+            }
+        }
+    }
+    memcpy(sc.fog, s_cam.fog, sizeof s_cam.fog);
+    sc.fog[3] = 1.0f;
+    vkr_scene_set(s_vk, &sc);
+}
+
+/* The first 2D draw (screen space: w == 1) after the world in a frame: the
+ * scene pass runs before it, so the HUD stays untouched (vkr_scene_run). */
+static int s_scene_ran;
+
+/* RECOMP_SCENE_TRACE=2: every main-target draw of one frame (in game, 3 s
+ * after the first camera): index, w, depth state, blend, vertices.
+ * s_sdt: 0 waiting, 1 this frame, 2 done. */
+static int s_sdt;
+
+static void scene_trace_draw(float w, const VkrDrawState *st, uint32_t n)
+{
+    if (s_sdt != 1)
+        return;
+    fprintf(stderr, "[SCENEDRAW] #%u w %.3g depth %d/%d func %X blend %d %X/%X alpha %X n %u stages %05X\n",
+            s_frame_draw_no, w, st->depth_test, st->depth_write, st->depth_func, st->blend_enable,
+            st->blend_src, st->blend_dst, st->alpha_func, n, st->u.stage_program);
+}
+
+static void scene_before_2d(float w)
+{
+    if (!s_cam.valid || s_scene_ran || w != 1.0f)
+        return;
+    s_scene_ran = 1;
+    {
+        static int tr = -1;
+        static double last;
+        if (tr < 0) tr = getenv("RECOMP_SCENE_TRACE") != NULL;
+        if (tr && now_ms() - last > 1000.0) {
+            last = now_ms();
+            fprintf(stderr, "[SCENE] pass at draw %u of the frame (last frame had %u)\n",
+                    s_frame_draw_no, s_frame_draws_last);
+        }
+    }
+    scene_flip();
+    vkr_scene_run(s_vk);
+}
+
+/* w of the program's first vertex, run on the CPU. */
+static float vsh_first_w(const float *in, const Nv2aVshProgram *p)
+{
+    float vin[NV2A_VSH_INPUTS][4];
+    Nv2aVshOutput o;
+    int a;
+    memset(vin, 0, sizeof vin);
+    for (a = 0; a < NV2A_VSH_INPUTS; a++)
+        if (p->in_slot[a] != 0xFF)
+            memcpy(vin[a], in + p->in_slot[a] * 4, sizeof vin[a]);
+    if (!nv2a_vsh_run((const float (*)[4])vin, &o))
+        return 0.0f;
+    return o.pos[3];
+}
+
 static int be_draw(const Nv2aTarget *t, uint32_t prim, const Nv2aVshOutput *v, uint32_t n)
 {
     uint32_t *idx, k = 0, topo;
@@ -645,7 +1191,7 @@ static int be_draw(const Nv2aTarget *t, uint32_t prim, const Nv2aVshOutput *v, u
     double td = 0;
     if (s_stats < 0) s_stats = getenv("RECOMP_VKR_STATS") != NULL;
     if (s_stats) { td = now_ms(); stats_tick(); }
-    if (!is_main(t)) {
+    if (!select_target(t)) {
         /* RECOMP_VKR_SKIP_RT=1 (measurement): drop draws into swizzled
          * render targets (the rider shadow maps) instead of handing them to
          * the software rasteriser -- what drawing them costs. */
@@ -676,6 +1222,10 @@ static int be_draw(const Nv2aTarget *t, uint32_t prim, const Nv2aVshOutput *v, u
         }
         if (s_trace == 2)
             trace_draw(t, prim, v, n, &st);
+        if (!t->swizzled && !is_rt(t->color_offset) && n) {
+            scene_trace_draw(v[0].pos[3], &st, n);
+            scene_before_2d(v[0].pos[3]);
+        }
         t2 = s_stats ? now_ms() : 0;
         vkr_draw(s_vk, (const VkrVertex *)v, n, idx, k, &st);
         if (s_stats) { s_t[3] += now_ms() - t2; s_n[0]++; }
@@ -699,7 +1249,7 @@ static int be_draw_vsh(const Nv2aTarget *t, uint32_t prim, const float *in, uint
         return 0;
     if (s_stats < 0) s_stats = getenv("RECOMP_VKR_STATS") != NULL;
     if (s_stats) { td = now_ms(); stats_tick(); }
-    if (!is_main(t))
+    if (!select_target(t))
         return 0;
     if (!(idx = build_idx(prim, n, &k, &topo)))
         return 0;
@@ -713,6 +1263,7 @@ static int be_draw_vsh(const Nv2aTarget *t, uint32_t prim, const float *in, uint
         st.topology = topo;
         bind_textures(&st);
         primlog(&st, n, 1);
+        scene_camera(&st, in, p);
         {
             static int no_shadow = -1;
             if (no_shadow < 0) no_shadow = getenv("RECOMP_VKR_NO_SHADOW") != NULL;
@@ -738,6 +1289,12 @@ static int be_draw_vsh(const Nv2aTarget *t, uint32_t prim, const float *in, uint
                                     p->consts[i][1], p->consts[i][2], p->consts[i][3]);
                 }
             }
+        }
+        if (s_cam.valid && !t->swizzled && !is_rt(t->color_offset) && n) {
+            float w0 = vsh_first_w(in, p);
+            scene_trace_draw(w0, &st, n);
+            if (!s_scene_ran)
+                scene_before_2d(w0);
         }
         t2 = s_stats ? now_ms() : 0;
         if (!vkr_draw_vsh(s_vk, in, n, p->nin, &p->ins[0][0], p->nins, p->hash, p->consts,
@@ -784,7 +1341,7 @@ static void clearlog(const Nv2aTarget *t, uint32_t flags, float depth)
 static int be_clear(const Nv2aTarget *t, uint32_t flags, uint32_t argb, float depth)
 {
     float c[4];
-    if (!is_main(t))
+    if (!select_target(t))
         return 0;
     clearlog(t, flags, depth);
     c[0] = (float)((argb >> 16) & 0xFF) / 255.0f;
@@ -858,6 +1415,7 @@ static void be_flip(const Nv2aTarget *t)
     FlipJob j;
     double tf;
     ssx3_last_flip_ms = xbox_TickCountMs();
+    ab_flip();
 #ifdef _WIN32
     ssx3_exec_tid = (uint32_t)GetCurrentThreadId();
 #endif
@@ -907,6 +1465,7 @@ static void be_flip(const Nv2aTarget *t)
     if (!s_dirty || t->bpp != 4 || t->pitch / 4 < s_w)
         return;
     tf = s_stats ? now_ms() : 0;
+    scene_flip();
     j.slot = vkr_flip_submit(s_vk);
     if (s_stats) { s_t[4] += now_ms() - tf; s_n[2]++; }
     if (j.slot < 0)
@@ -920,6 +1479,22 @@ static void be_flip(const Nv2aTarget *t)
     pthread_cond_signal(&s_job_cond);
     pthread_mutex_unlock(&s_job_lock);
     s_dirty = 0;
+    {
+        int had_cam = s_cam.valid;
+        static int tr = -1;
+        static double t0;
+        if (tr < 0) { const char *e = getenv("RECOMP_SCENE_TRACE"); tr = e ? atoi(e) : 0; }
+        if (s_sdt == 1)
+            s_sdt = 2;
+        else if (tr == 2 && s_sdt == 0 && had_cam) {
+            if (!t0) t0 = now_ms();
+            else if (now_ms() - t0 > 3000.0) s_sdt = 1;
+        }
+    }
+    s_cam.valid = 0;
+    s_scene_sent = s_scene_ran = 0;
+    s_frame_draws_last = s_frame_draw_no;
+    s_frame_draw_no = 0;
     follow_window();
 }
 

@@ -31,6 +31,13 @@ CPU): race at a steady 60 FPS. The black
 shapes over the race backdrop were the executor dropping ARRAY_ELEMENT32
 (0x1808, the odd last index of an index list) -- fixed in the toolkit patch.
 
+**Remaster look (2026-10-16, `RECOMP_REMASTER`, default on):** MSAA 4x +
+alpha to coverage, GPU rider shadow maps (4x, soft), sharpen/bloom/grade/
+deband post pass, DXT deblocking -- one flag per part, listed in `src/main.c`
+and docs/HANDOFF.md. Also: x86_64 Linux + native Wayland (docs/LINUX.md,
+`tools/play.sh`), and the combiner shader no longer indexes `R[]`
+dynamically (race GPU time halved).
+
 **Roadmap:** [docs/ROADMAP.md](docs/ROADMAP.md) is the plan and tracker (phases,
 gates, checkboxes, progress log). Work from it: pick the next unchecked item of
 the earliest open phase, tick it in the commit that lands it, and add a dated

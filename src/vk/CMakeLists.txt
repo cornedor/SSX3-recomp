@@ -30,6 +30,7 @@ function(vkr_shader stage)
         COMMAND ${CMAKE_COMMAND} -DIN=${spv} -DOUT=${hdr} -DNAME=${name}_spv
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spv.cmake"
         DEPENDS "${src}" "${CMAKE_CURRENT_SOURCE_DIR}/embed_spv.cmake"
+                "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_common.glsl"
         VERBATIM)
     set(VKR_HEADERS ${VKR_HEADERS} "${hdr}" PARENT_SCOPE)
 endfunction()
@@ -45,15 +46,23 @@ function(vkr_shader_variant stage base name def)
         COMMAND ${CMAKE_COMMAND} -DIN=${spv} -DOUT=${hdr} -DNAME=${name}_spv
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spv.cmake"
         DEPENDS "${src}" "${CMAKE_CURRENT_SOURCE_DIR}/embed_spv.cmake"
+                "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_common.glsl"
         VERBATIM)
     set(VKR_HEADERS ${VKR_HEADERS} "${hdr}" PARENT_SCOPE)
 endfunction()
 vkr_shader(vert)
 vkr_shader(frag)
 vkr_shader_variant(frag xbox xbox_frag_wdepth W_DEPTH)
+vkr_shader_variant(frag xbox xbox_frag_a2c A2C)
 vkr_shader(vert xbox_vsh)
 vkr_shader(vert crt)
 vkr_shader(frag crt)
+vkr_shader(frag post)
+vkr_shader(frag rt_soft)
+vkr_shader(frag scene)
+vkr_shader_variant(frag scene scene_ms_frag MS)
+vkr_shader(frag scene_ao)
+vkr_shader_variant(frag scene_ao scene_ao_ms_frag MS)
 
 add_library(vkr STATIC vkr.c ${VKR_HEADERS})
 # vkr_backend.c is added by the game build (needs the toolkit headers).

@@ -72,6 +72,8 @@ void vkr_clear_ds(VkrContext *c, int clear_depth, float depth, int clear_stencil
 VkrTex *vkr_tex_find(VkrContext *c, uint64_t key);
 VkrTex *vkr_tex_create(VkrContext *c, uint64_t key, uint32_t w, uint32_t h,
                        const uint32_t *pixels);
+VkrTex *vkr_tex_create_ex(VkrContext *c, uint64_t key, uint32_t w, uint32_t h,
+                          const uint32_t *pixels, int mips);   /* mips: with a mip chain */
 int vkr_tex_update(VkrContext *c, VkrTex *t, uint64_t key, const uint32_t *pixels);
 uint32_t vkr_tex_generation(VkrContext *c);   /* changes when all textures were freed */
 
@@ -86,6 +88,32 @@ int vkr_draw_vsh(VkrContext *c, const float *in, uint32_t nverts, uint32_t nin,
                  const uint32_t *prog, uint32_t nins, uint32_t prog_hash,
                  const float (*consts)[4], const uint32_t *idx, uint32_t nidx,
                  const VkrDrawState *st);
+
+/* RECOMP_VKR_GPU_RT: render targets the title draws and samples later (the
+ * rider shadow maps) on the GPU. vkr_rt_bind: draws and clears go to the one
+ * for guest surface off (w x h; created on first use, 0 on failure);
+ * vkr_use_main: back to the main target; vkr_rt_texture: it as a texture
+ * (NULL if never drawn). */
+int vkr_rt_bind(VkrContext *c, uint32_t off, uint32_t w, uint32_t h, float zmax);
+void vkr_use_main(VkrContext *c);
+VkrTex *vkr_rt_texture(VkrContext *c, uint32_t off, uint32_t w, uint32_t h);
+
+/* The scene camera for the frame being recorded (RECOMP_AO, _HAZE, _SHAFTS,
+ * _RIM, _MBLUR): inv_m maps (guest pixel x, y, depth units - zmax, 1) to
+ * eye-relative world positions (homogeneous), prev_m eye-relative positions
+ * to last frame's (x w, y w, z w, w); column-major. sun: direction to the
+ * sun, w = visibility; sun_px: its guest pixel position (xy) and the screen
+ * direction towards it (zw); fog: the haze colour. Valid until the flip. */
+typedef struct {
+    float inv_m[16], prev_m[16];
+    float sun[4], sun_px[4], fog[4];
+} VkrScene;
+void vkr_scene_set(VkrContext *c, const VkrScene *s);
+/* Run the scene pass now (before the HUD); once per frame, after vkr_scene_set. */
+void vkr_scene_run(VkrContext *c);
+/* A/B shots (RECOMP_AB): 1 = the per-frame
+ * features (bicubic, scene pass, post pass) off. */
+void vkr_ab_off(VkrContext *c, int off);
 
 /* RECOMP_WIDESCREEN target: 1 = show the 4:3 picture pillarboxed (menus). */
 void vkr_set_pillarbox(VkrContext *c, int on);

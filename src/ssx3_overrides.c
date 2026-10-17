@@ -233,6 +233,17 @@ void sub_0009C7A0(void)
     }
 }
 
+/* In-game update (sub_000CC8F0, this = ingame state): the first-person
+ * shooter mode (src/fps_mode.c) moves the camera and fires after it. */
+extern void sub_000CC8F0_gen(void);
+extern void ssx3_FpsTick(void);
+
+void sub_000CC8F0(void)
+{
+    sub_000CC8F0_gen();
+    ssx3_FpsTick();
+}
+
 /* In-game screen opener sub_000C4C20(type), cdecl: RECOMP_STATION_TRACE=1
  * logs each call with the type and the guest return addresses on the stack
  * (who opened it: 0x1F = "enter the lodge?"). */

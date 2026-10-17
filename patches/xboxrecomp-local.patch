@@ -1,5 +1,5 @@
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index 258048c..ce8ded3 100644
+index 258048c..1c1ce59 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
 @@ -319,12 +319,15 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
@@ -23,7 +23,7 @@ index 258048c..ce8ded3 100644
  
      WAVEFORMATEX wfx = { 0 };
      wfx.wFormatTag      = WAVE_FORMAT_PCM;
-@@ -377,12 +380,74 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
+@@ -377,12 +380,81 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
              g_waveout.frames_written);
  }
  
@@ -62,6 +62,10 @@ index 258048c..ce8ded3 100644
 +    }
 +}
 +
++/* Set by the title's host code: called with each 48 kHz stereo frame just
++ * before it is submitted, to mix sounds of its own on top. */
++void (*xbox_ApuPostMix)(int16_t *stereo, int samples);
++
  void mcpx_apu_monitor_frame(MCPXAPUState *d)
  {
      if ((d->ep_frame_div + 1) % 8) {
@@ -86,6 +90,9 @@ index 258048c..ce8ded3 100644
 +        }
 +        if (!g_audio_muted)
 +            mixer_render(d->monitor.frame_buf, 256);
++        /* A title's own host-side sounds (SSX 3's FPS mode gunshots). */
++        if (!g_audio_muted && xbox_ApuPostMix)
++            xbox_ApuPostMix(&d->monitor.frame_buf[0][0], 256);
 +        /* Measured before the mute: a muted test run still shows whether
 +         * the title produced sound. */
 +        apu_level_note(&d->monitor.frame_buf[0][0], 256, 1);
@@ -98,7 +105,7 @@ index 258048c..ce8ded3 100644
      /* XAudio2 path: render and submit a buffer */
      if (xa2_is_active()) {
          int buf_size = xa2_get_buffer_size();
-@@ -413,12 +478,48 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
+@@ -413,12 +485,48 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
              remaining -= chunk;
          }
  
@@ -147,7 +154,7 @@ index 258048c..ce8ded3 100644
      int idx = g_waveout.next_buf;
      WAVEHDR *hdr = &g_waveout.hdrs[idx];
  
-@@ -483,10 +584,32 @@ static void throttle(MCPXAPUState *d)
+@@ -483,10 +591,32 @@ static void throttle(MCPXAPUState *d)
  
      int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
  
@@ -181,7 +188,7 @@ index 258048c..ce8ded3 100644
  
      while (!d->pause_requested) {
          now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-@@ -530,7 +653,9 @@ static void se_frame(MCPXAPUState *d)
+@@ -530,7 +660,9 @@ static void se_frame(MCPXAPUState *d)
  
      mcpx_apu_vp_frame(d, mixbins);
      mcpx_apu_dsp_frame(d, mixbins);
@@ -191,7 +198,7 @@ index 258048c..ce8ded3 100644
  
      d->ep_frame_div++;
  
-@@ -544,6 +669,12 @@ static void se_frame(MCPXAPUState *d)
+@@ -544,6 +676,12 @@ static void se_frame(MCPXAPUState *d)
  static void *mcpx_apu_frame_thread(void *arg)
  {
      MCPXAPUState *d = MCPX_APU_DEVICE(arg);
@@ -204,7 +211,7 @@ index 258048c..ce8ded3 100644
      qemu_mutex_lock(&d->lock);
  
      while (!qatomic_read(&d->exiting)) {
-@@ -605,6 +736,17 @@ static void *mcpx_apu_frame_thread(void *arg)
+@@ -605,6 +743,17 @@ static void *mcpx_apu_frame_thread(void *arg)
           * off every USB interrupt. */
          qemu_mutex_unlock(&d->lock);
          SwitchToThread();
@@ -222,7 +229,7 @@ index 258048c..ce8ded3 100644
          qemu_mutex_lock(&d->lock);
      }
  
-@@ -693,6 +835,14 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
+@@ -693,6 +842,14 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
          warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
      }
  

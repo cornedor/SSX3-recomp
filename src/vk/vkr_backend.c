@@ -64,6 +64,7 @@ extern int ssx3_WidescreenNow(void);
 extern float ssx3_Aspect(void);
 extern void ssx3_SetAspect(float a);
 extern int xbox_FramebufferClientSize(int *w, int *h);
+extern void ssx3_FpsOverlay(uint32_t *px, int w, int h, int stride);
 
 _Static_assert(sizeof(VkrVertex) == sizeof(Nv2aVshOutput),
                "VkrVertex must mirror Nv2aVshOutput");
@@ -123,10 +124,15 @@ static void *flip_thread(void *unused)
             for (y = 0; y < j.h; y++)
                 memcpy(mem + j.offset + (size_t)(j.y + y) * j.pitch + (size_t)j.x * 4,
                        px + (size_t)y * j.w * 4, (size_t)j.w * 4);
+            /* First-person shooter mode: crosshair and gun (src/fps_mode.c). */
+            ssx3_FpsOverlay((uint32_t *)(mem + j.offset + (size_t)j.y * j.pitch + (size_t)j.x * 4),
+                            (int)j.w, (int)j.h, (int)(j.pitch / 4));
             /* Higher internal resolution: the window shows the full image. */
             full = vkr_frame_pixels_full(s_vk, j.slot, &fw, &fh);
-            if (full)
+            if (full) {
+                ssx3_FpsOverlay((uint32_t *)full, (int)fw, (int)fh, (int)fw);
                 xbox_FramebufferPublishImage((const uint32_t *)full, fw, fh);
+            }
         }
         pthread_mutex_lock(&s_job_lock);
         s_job_head = (s_job_head + 1) % 4;

@@ -966,6 +966,20 @@ All env defaults are set in `src/main.c` only when unset, so a run can override 
   linear search over every texture ever made), the process opts out of
   Windows power/timer-resolution throttling, and the window thread sleeps
   while its swap chain is occluded.
+- FPS MODE (2026-10-17, for fun): RECOMP_FPS=1 / F4 / `play.bat fps` --
+  src/fps_mode.c, called after the in-game update (sub_000CC8F0 wrapper).
+  First-person camera at player 1's head, mouse aims (Windows: cursor
+  recentred; SDL: relative mode), left button fires, a hit rider wipes out
+  through the game's own sub_0002F620; gun (3D model rendered once into
+  cached sprites), flash, brass, smoke, hit mist drawn into each frame in
+  the vkr_backend.c flip thread; gunshot sound mixed in through the toolkit
+  hook xbox_ApuPostMix (apu_core.c). RECOMP_FPS_SHOTS=<dir> saves flash
+  frames, RECOMP_FPS_AUTOFIRE=<ms> fires on its own (test aids). Map: rider manager
+  [[[0x369534]+0x74]+0xC] (vtable 0x28216C), riders at +0x28 (6, slot 0 =
+  player 1); rider +0x180 position (Z-up world), +0x250 velocity, physics
+  [+0x74C] mode +0xE60 (names at 0x283274: 0 Ground 1 Air 2 Wipeout 3
+  Static ... 12 Gate); camera [[ingame+0x84]+4] (vtable 0x28630C, eye +0x30,
+  view matrix +0x50). Header comment of fps_mode.c has the details.
 - Untranslated instructions reached (no-ops): `wbinvd`, `out`/`in`, `ldmxcsr`.
 - Upstream candidates: the toolkit fixes in `patches/`; `tools.split`
   ignoring applied names (docs/DECOMP.md says otherwise); template

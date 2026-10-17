@@ -32,28 +32,63 @@ void main()
         s3d = false;
     float scl = sc.dims2.z / 1080.0;                /* pixel sizes are for 1080 lines */
 
-    if (s3d) {
-        vec3 P = pos_at(gl_FragCoord.xy, d);
-        float dist = length(P);
+    /* where the pixel is: the sky at the far plane (camera turns blur it too) */
+    vec3 P = pos_at(gl_FragCoord.xy, sky ? 1.0 : d);
+    float dist = sky ? 1e9 : length(P);
+    bool rider = tag_rider(src.a);
 
-        if (sc.fx.y > 0.0 && dist > sc.dims2.w) {
-            vec4 pc = sc.prev_m * vec4(P, 1.0);
-            if (pc.w > 1e-3) {
-                vec2 prev = pc.xy / pc.w / sc.dims.zw;          /* target pixels */
-                vec2 vel = (gl_FragCoord.xy - prev) * sc.fx.y;
-                float len = length(vel), mx = 48.0 * scl;
-                if (len > mx) vel *= mx / len;
-                /* fade in past the near distance: no seam at the rider */
-                vel *= smoothstep(sc.dims2.w, sc.dims2.w * 2.0, dist);
-                if (length(vel) > 0.5) {
-                    vec3 acc = vec3(0.0);
-                    for (int i = 0; i < 8; i++)
-                        acc += frame(gl_FragCoord.xy + vel * ((float(i) + 0.5) / 8.0 - 0.5));
-                    col = acc / 8.0;
+    if (sc.dof.x > 0.0 && (sky || s3d) && dist > sc.dof.y) {
+        /* RECOMP_DOF: the far course and the backdrop soften, the rider and
+         * the course near them stay sharp. A disk of 16 taps (Vogel spiral)
+         * as wide as this pixel's blur; taps nearer than the blur's start
+         * (the rider, near trees) are left out, so they do not bleed into
+         * what is behind them. */
+        float coc = sc.dof.x * scl * smoothstep(sc.dof.y, sc.dof.z, dist);
+        if (coc > 0.4) {
+            vec3 acc = col;
+            float wsum = 1.0;
+            float rot = hash12(gl_FragCoord.xy) * 6.2831853;
+            for (int i = 0; i < 16; i++) {
+                float r = sqrt((float(i) + 0.5) / 16.0) * coc;
+                float a = float(i) * 2.3999632 + rot;
+                vec2 q = gl_FragCoord.xy + vec2(cos(a), sin(a)) * r;
+                float qd = depth_at(ivec2(q));
+                if (!is_sky(qd) && length(pos_at(q, qd)) < sc.dof.y)
+                    continue;
+                acc += frame(q);
+                wsum += 1.0;
+            }
+            col = acc / wsum;
+        }
+    }
+
+    if (sc.fx.y > 0.0 && (sky || s3d) && !rider && dist > sc.dims2.w) {
+        /* RECOMP_MBLUR: reprojected with last frame's camera and blurred
+         * along the difference, up to the camera (the snow rushing past is
+         * where the speed shows); riders ride with the camera and stay
+         * sharp, and their pixels are kept out of the blur behind them. */
+        vec4 pc = sc.prev_m * vec4(P, 1.0);
+        if (pc.w > 1e-3) {
+            vec2 prev = pc.xy / pc.w / sc.dims.zw;              /* target pixels */
+            vec2 vel = (gl_FragCoord.xy - prev) * sc.fx.y;
+            float len = length(vel), mx = 96.0 * scl;
+            if (len > mx) vel *= mx / len;
+            if (length(vel) > 0.75) {
+                vec3 acc = col;
+                float wsum = 1.0, j = hash12(gl_FragCoord.xy + sc.dims3.z) - 0.5;
+                for (int i = 0; i < 12; i++) {
+                    vec2 q = gl_FragCoord.xy + vel * ((float(i) + 0.5 + j) / 12.0 - 0.5);
+                    if (tag_rider(texelFetch(img, clamp(ivec2(q), ivec2(0), tsize() - 1), 0).a))
+                        continue;
+                    acc += frame(q);
+                    wsum += 1.0;
                 }
+                col = acc / wsum;
             }
         }
+    }
 
+    if (s3d) {
         if (sc.ao.x > 0.0) {
             /* 4x4 of the half-resolution result (the whole 4x4 rotation
              * pattern), weighted by depth likeness: the pattern averages
@@ -130,8 +165,15 @@ void main()
                 dc = vec3(texelFetch(aot, ivec2(gl_FragCoord.xy * 0.5), 0).r);
             else if (sc.dims3.w < 2.5)
                 dc = normalize(cross(dFdx(P), dFdy(P))) * 0.5 + 0.5;
-            else
+            else if (sc.dims3.w < 3.5)
                 dc = vec3(fract(length(P) / 1000.0), length(P) / 20000.0, 0.0);
+        }
+        if (sc.dims3.w > 3.5) {
+            /* 4: the AO tags -- ground green, solid objects red, riders
+             * yellow, the rest blue, over the picture's brightness */
+            float t = src.a, l = 0.3 + 0.7 * luma(src.rgb);
+            dc = (tag_ground(t) ? vec3(0.2, 1.0, 0.2) : tag_solid(t) ? vec3(1.0, 0.2, 0.2)
+                  : tag_rider(t) ? vec3(1.0, 0.9, 0.1) : vec3(0.2, 0.3, 1.0)) * l;
         }
         col = dc;
     }

@@ -13,6 +13,12 @@ layout(location = 5) in vec4 v_tex2;
 layout(location = 6) in vec4 v_tex3;
 
 layout(location = 0) out vec4 out_color;
+#ifdef TAGS
+/* AO tags (vkr.c get_pipeline): out_color.a carries the draw's class for the
+ * scene pass -- 0 other, 1/3 solid world object, 2/3 ground, 1 rider -- and the
+ * blend equation takes the real alpha from this second source instead. */
+layout(location = 0, index = 1) out vec4 out_src1;
+#endif
 
 layout(set = 0, binding = 0) uniform sampler2D tex[4];
 
@@ -32,7 +38,9 @@ layout(push_constant) uniform PC {
     float w_scale;                        /* W-buffering: depth = w * this; 0 = off */
     uint point_sprite;                    /* stage 3 coordinates = gl_PointCoord (xemu psh.c) */
     uint flags;                           /* bits 8-15 MSAA sample count (A2C variant),
-                                           * 16 RECOMP_TEX_BICUBIC */
+                                           * 16 RECOMP_TEX_BICUBIC, 17-18 AO class (TAGS),
+                                           * 20 RECOMP_AO_TAGS=prog */
+    uint prog;                            /* vertex program hash (0 = none) */
 } pc;
 
 
@@ -363,6 +371,16 @@ void main()
             discard;
     }
     out_color = col;
+#ifdef TAGS
+    out_src1 = col;
+    out_color.a = float((pc.flags >> 17) & 3u) / 3.0;
+#endif
+    if ((pc.flags & 0x100000u) != 0u) {
+        /* a colour per vertex program, shaded by the draw's own brightness */
+        uint h = pc.prog * 2654435761u;
+        vec3 k = vec3(float(h & 255u), float((h >> 8) & 255u), float((h >> 16) & 255u)) / 255.0;
+        out_color.rgb = pc.prog == 0u ? vec3(0.5) : k * (0.4 + 0.6 * dot(col.rgb, vec3(0.333)));
+    }
 #ifdef W_DEPTH
     /* CONTROL0 Z_PERSPECTIVE: the depth test compares w, which is linear in
      * distance, instead of z, whose precision is spent near the camera (the

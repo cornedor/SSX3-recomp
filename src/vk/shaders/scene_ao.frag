@@ -5,10 +5,14 @@
  * (vkr.c scene_pass; scene.frag blurs and applies it). Scalable Ambient
  * Obscurance style (McGuire et al. 2012): taps on a spiral around the pixel,
  * reconstructed into eye-relative positions, each occluding by how steeply
- * it rises above the surface's tangent plane (30 degrees and up), fading
- * out with distance. The
- * spiral turns per pixel (4x4 pattern); scene.frag's blur averages the
- * pattern out. Only darkens -- the game's lighting is the base. */
+ * it rises above the surface's tangent plane, fading out with distance.
+ *
+ * Who darkens whom comes from the AO tags in the frame's alpha (xbox.frag
+ * TAGS, vkr_backend.c ao_class): only the ground receives, only solid world
+ * objects (rocks, trees, rails, signs, gates) occlude. So the snow darkens
+ * where it meets them, while riders, trails, spray, thin beams and the
+ * terrain's own folds are left alone. The spiral turns per pixel (4x4
+ * pattern); scene.frag's blur averages the pattern out. Only darkens. */
 
 #include "scene_common.glsl"
 
@@ -31,12 +35,14 @@ vec3 normal_at(ivec2 ip, vec3 P)
     return dot(n, P) > 0.0 ? -n : n;            /* towards the eye */
 }
 
+float tag_at(ivec2 p) { return texelFetch(img, clamp(p, ivec2(0), tsize() - 1), 0).a; }
+
 void main()
 {
     ivec2 ip = ivec2(gl_FragCoord.xy * 2.0);
     float d = depth_at(ip);
-    if (is_sky(d) || !is_3d(ip)) {
-        o = vec4(1.0, 1e9, 0.0, 1.0);
+    if (is_sky(d) || !tag_ground(tag_at(ip))) {
+        o = vec4(1.0, is_sky(d) ? 1e9 : length(pos_at(vec2(ip) + 0.5, d)), 0.0, 1.0);
         return;
     }
     vec3 P = pos_at(vec2(ip) + 0.5, d);
@@ -54,21 +60,18 @@ void main()
         vec2 off = vec2(cos(ang), sin(ang)) * (a * rpx);
         ivec2 tp = ip + ivec2(off);
         float td = depth_at(tp);
-        if (is_sky(td))
+        if (is_sky(td) || !tag_solid(tag_at(tp)))
             continue;
         vec3 v = pos_at(vec2(tp) + 0.5, td) - P;
         float vv = dot(v, v), vn = dot(v, N);
-        /* what rises steeply (above ~20 degrees) and well above the surface
-         * (60 to 120 world units = cm) occludes: trees, rocks, riders,
-         * fences, walls -- not the board trails, troughs whose walls are
-         * lower than that. Weighted down linearly to the radius. */
+        /* above the tangent plane (beyond ~6 degrees: no self-darkening of
+         * the snow under a rail lying on it), weighted down to the radius */
         float el = vn / sqrt(vv + 1e-4);
-        float tall = smoothstep(60.0, 120.0, vn);
         float fall = max(1.0 - vv / R2, 0.0);
-        sum += clamp((el - 0.35) / 0.65, 0.0, 1.0) * tall * fall;
+        sum += clamp((el - 0.1) / 0.9, 0.0, 1.0) * fall;
     }
-    /* a trunk covers only a few of the taps around a pixel at its foot:
-     * scaled so that a quarter of them darkens fully */
-    float ao = clamp(1.0 - sum * sc.haze.w / float(taps), 0.0, 1.0);
+    /* a soft curve that never reaches black: a deep corner under a rail or
+     * an overhang stays shaded snow, not a hole */
+    float ao = 1.0 - 0.7 * (1.0 - exp(-sum * sc.haze.w / float(taps)));
     o = vec4(ao, length(P), 0.0, 1.0);          /* .g: distance, for the blur's weights */
 }

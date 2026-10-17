@@ -27,7 +27,8 @@ layout(set = 0, binding = 4, std140) uniform S {
     vec4 fx;            /* shafts, motion blur, rim strength, rim range (world units) */
     vec4 dims;          /* guest w, h; guest pixels per target pixel x, y */
     vec4 dims2;         /* zmax, target w, h, motion blur near (world units) */
-    vec4 dims3;         /* ao image w, h, time, - */
+    vec4 dims3;         /* ao image w, h, time, debug view */
+    vec4 dof;           /* largest blur (pixels at 1080 lines), starts, full (world units), - */
 } sc;
 
 ivec2 tsize() { return ivec2(sc.dims2.yz); }
@@ -53,6 +54,12 @@ bool is_sky(float d) { return d >= 1.0; }
 
 /* The pass runs before the HUD (vkr_scene_run): everything drawn is world. */
 bool is_3d(ivec2 p) { return true; }
+
+/* AO tags (xbox.frag TAGS) in the frame's alpha: 0 other, 1/3 solid world
+ * object, 2/3 ground, 1 rider. MSAA edges average neighbours. */
+bool tag_solid(float t) { return t > 0.17 && t < 0.5; }
+bool tag_ground(float t) { return t >= 0.5 && t < 0.83; }
+bool tag_rider(float t) { return t >= 0.83; }
 
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 

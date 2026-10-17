@@ -51,6 +51,8 @@ typedef struct {
     int      stencil_test;
     uint32_t stencil_func, stencil_ref, stencil_read_mask, stencil_write_mask;
     uint32_t stencil_fail, stencil_zfail, stencil_zpass;
+    uint32_t prog;                  /* vertex program hash, 0 = none (RECOMP_AO_TAGS) */
+    int      ao_class;              /* AO tag: 0 other, 1 solid world object, 2 ground */
 } VkrDrawState;
 
 #define VKR_TOPO_TRIANGLES 0

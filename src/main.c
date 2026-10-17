@@ -882,12 +882,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      *     RECOMP_VIBRANCE=0.15  RECOMP_CONTRAST=0.1  gentle grade
      *     RECOMP_DEBAND=1       no banding in gradients
      *     RECOMP_DEBLOCK=32     DXT block seams smoothed (texture decode)
-     *     RECOMP_AO=0.8         ambient occlusion from the depth buffer
+     *     RECOMP_AO=0.8         ambient occlusion: snow darkens next to rocks, trees, rails
      *     RECOMP_HAZE=0.35      distance fades towards the event's fog colour
      *     RECOMP_SHAFTS=1       light shafts when the sun is on screen
      *     RECOMP_RIM=0.2        sun-side rim light on near silhouettes (riders)
      *   (scene pass: in game only; finer knobs in RECOMP_SCENE_PARAMS, vkr.c)
      *   Not in it: RECOMP_MBLUR (camera motion blur, 1 = full shutter),
+     *   RECOMP_DOF (far depth of field, 3 = subtle),
      *   RECOMP_TEX_BICUBIC (Catmull-Rom for magnified textures),
      *   RECOMP_VIGNETTE, RECOMP_CRT. */
     {

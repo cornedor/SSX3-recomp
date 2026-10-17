@@ -13,6 +13,9 @@
 #include "crt_vert_spv.h"
 #include "crt_frag_spv.h"
 #include "xbox_frag_a2c_spv.h"
+#include "xbox_frag_tags_spv.h"
+#include "xbox_frag_wdepth_tags_spv.h"
+#include "xbox_frag_a2c_tags_spv.h"
 #include "post_frag_spv.h"
 #include "rt_soft_frag_spv.h"
 #include "scene_ao_frag_spv.h"
@@ -128,6 +131,9 @@ struct VkrContext {
     VkPipelineLayout layout;
     VkShaderModule vs, fs, fs_wdepth, vs_vsh;  /* fs_wdepth: W-buffered draws */
     VkShaderModule fs_a2c;                     /* RECOMP_A2C: alpha-tested draws under MSAA */
+    VkShaderModule fs_tags[3];                 /* the three above with AO tags (TAGS) */
+    int dual_src;                              /* dualSrcBlend enabled */
+    int tags;                                  /* AO tags on: main-target draws write their class to alpha */
 
     struct PipeEntry { uint32_t key[8]; VkPipeline pipe; } pipes[200];
     int npipes;
@@ -232,8 +238,9 @@ struct VkrContext {
     /* The scene pass (scene.frag, scene_ao.frag): RECOMP_AO, _HAZE, _SHAFTS,
      * _RIM, _MBLUR, on frames with a camera (vkr_scene_set). */
     int scene, texsmooth;
+    int tag_debug;                  /* RECOMP_AO_TAGS=prog */
     int ab_off;                     /* vkr_ab_off: per-frame features off (A/B shots) */
-    float sc_p[13];                 /* ao haze shafts rim mblur | radius taps start density rimrange near mindist gain */
+    float sc_p[16];                 /* ao haze shafts rim mblur | radius taps start density rimrange near mindist gain | dof dofstart dofend */
     VkrScene cam;
     int cam_valid;
     VkDescriptorSetLayout sc_dsl;
@@ -480,6 +487,14 @@ static VkBlendFactor blend_factor(uint32_t f)
     }
 }
 
+/* AO tags: the alpha the game blends with is the second source's */
+static VkBlendFactor src1_factor(VkBlendFactor f)
+{
+    return f == VK_BLEND_FACTOR_SRC_ALPHA ? VK_BLEND_FACTOR_SRC1_ALPHA
+         : f == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA ? VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA
+         : f;
+}
+
 static VkBlendOp blend_op(uint32_t e)
 {
     switch (e) {
@@ -501,7 +516,7 @@ static int make_layout(VkrContext *c)
     };
     VkDescriptorSetLayoutCreateInfo di = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     VkPushConstantRange pcr[2] = {{VK_SHADER_STAGE_VERTEX_BIT, 0, 64},
-                                  {VK_SHADER_STAGE_FRAGMENT_BIT, 64, 20}};
+                                  {VK_SHADER_STAGE_FRAGMENT_BIT, 64, 24}};
     VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
 
     c->vs = shader(c, xbox_vert_spv, xbox_vert_spv_len);
@@ -510,6 +525,12 @@ static int make_layout(VkrContext *c)
     c->vs_vsh = shader(c, xbox_vsh_vert_spv, xbox_vsh_vert_spv_len);
     c->fs_a2c = shader(c, xbox_frag_a2c_spv, xbox_frag_a2c_spv_len);
     if (!c->vs || !c->fs || !c->fs_wdepth || !c->vs_vsh || !c->fs_a2c) { fprintf(stderr, "[VKR] shader module failed\n"); return 0; }
+    if (c->dual_src) {
+        c->fs_tags[0] = shader(c, xbox_frag_tags_spv, xbox_frag_tags_spv_len);
+        c->fs_tags[1] = shader(c, xbox_frag_wdepth_tags_spv, xbox_frag_wdepth_tags_spv_len);
+        c->fs_tags[2] = shader(c, xbox_frag_a2c_tags_spv, xbox_frag_a2c_tags_spv_len);
+        if (!c->fs_tags[0] || !c->fs_tags[1] || !c->fs_tags[2]) c->dual_src = 0;
+    }
     di.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
     di.bindingCount = 3; di.pBindings = b;
     CK(vkCreateDescriptorSetLayout(c->dev, &di, NULL, &c->dsl));
@@ -750,16 +771,18 @@ static int make_fs_pipe_ms(VkrContext *c, VkShaderModule fs, VkPipelineLayout la
  *   RECOMP_SHAFTS=<strength>      RECOMP_RIM=<strength>
  *   RECOMP_MBLUR=<strength, 1 = the full frame-to-frame motion>
  *   RECOMP_TEX_BICUBIC=1 (xbox.frag; not part of the pass)
- * RECOMP_SCENE_PARAMS=name=value,...: radius (AO, world units, 200) taps (12)
+ * RECOMP_SCENE_PARAMS=name=value,...: radius (AO, world units, 500) taps (16)
  * start (haze, 5000) density (haze per unit, 0.00004) rimrange (900)
- * near (motion blur starts, 600) mindist (nearer = HUD models, 120) gain
- * (AO: occlusion per tap, 12). World
+ * near (motion blur starts, 0) mindist (nearer = HUD models, 120) gain
+ * (AO: occlusion per tap, 12) dofstart dofend (RECOMP_DOF: blur grows from
+ * 4000 to 25000). RECOMP_DOF=<largest blur, pixels at 1080 lines>. World
  * units are SSX 3's (cm). */
 static void scene_config(VkrContext *c)
 {
     static const char *const env[5] = {"RECOMP_AO", "RECOMP_HAZE", "RECOMP_SHAFTS", "RECOMP_RIM", "RECOMP_MBLUR"};
-    static const char *const names[8] = {"radius", "taps", "start", "density", "rimrange", "near", "mindist", "gain"};
-    static const float def[8] = {200.0f, 16.0f, 5000.0f, 0.00004f, 900.0f, 600.0f, 120.0f, 12.0f};
+    static const char *const names[10] = {"radius", "taps", "start", "density", "rimrange", "near", "mindist", "gain",
+                                          "dofstart", "dofend"};
+    static const float def[10] = {500.0f, 16.0f, 5000.0f, 0.00004f, 900.0f, 0.0f, 120.0f, 12.0f, 4000.0f, 25000.0f};
     const char *e;
     char buf[512], *tok, *save = NULL;
     int i;
@@ -767,7 +790,10 @@ static void scene_config(VkrContext *c)
         e = getenv(env[i]);
         c->sc_p[i] = e && *e ? (float)atof(e) : 0.0f;
     }
-    memcpy(&c->sc_p[5], def, sizeof def);
+    memcpy(&c->sc_p[5], def, 8 * sizeof def[0]);
+    memcpy(&c->sc_p[14], &def[8], 2 * sizeof def[0]);
+    e = getenv("RECOMP_DOF");
+    c->sc_p[13] = e && *e ? (float)atof(e) : 0.0f;
     e = getenv("RECOMP_SCENE_PARAMS");
     if (e) {
         snprintf(buf, sizeof buf, "%s", e);
@@ -775,17 +801,19 @@ static void scene_config(VkrContext *c)
             char *eq = strchr(tok, '=');
             if (!eq) continue;
             *eq = 0;
-            for (i = 0; i < 8; i++)
+            for (i = 0; i < 10; i++)
                 if (!strcmp(tok, names[i]))
-                    c->sc_p[5 + i] = (float)atof(eq + 1);
+                    c->sc_p[i < 8 ? 5 + i : 6 + i] = (float)atof(eq + 1);
         }
     }
     if (c->sc_p[6] < 4.0f) c->sc_p[6] = 4.0f;
     if (c->sc_p[6] > 32.0f) c->sc_p[6] = 32.0f;
     c->scene = c->sc_p[0] > 0.0f || c->sc_p[1] > 0.0f || c->sc_p[2] > 0.0f || c->sc_p[3] > 0.0f
-               || c->sc_p[4] > 0.0f;
+               || c->sc_p[4] > 0.0f || c->sc_p[13] > 0.0f;
     e = getenv("RECOMP_TEX_BICUBIC");
     c->texsmooth = e && *e == '1';
+    e = getenv("RECOMP_AO_TAGS");
+    c->tag_debug = e && !strcmp(e, "prog");
 }
 
 static int make_scene(VkrContext *c)
@@ -953,6 +981,13 @@ static VkPipeline get_pipeline(VkrContext *c, const VkrDrawState *st, int gpu_vs
         key[7] |= 4u;
     if (c->cur_rt >= 0)                 /* a render target: one attachment, one sample */
         key[7] = (key[7] & 1u) | 8u;
+    else if (c->tags) {
+        /* tagged: the class goes to alpha where the draw writes depth, the
+         * alpha underneath stays where it does not */
+        key[7] |= 16u;
+        if (st->depth_test && st->depth_write)
+            key[7] |= 32u;
+    }
     for (i = 0; i < c->npipes; i++)
         if (!memcmp(c->pipes[i].key, key, sizeof key))
             return c->pipes[i].pipe;
@@ -964,6 +999,8 @@ static VkPipeline get_pipeline(VkrContext *c, const VkrDrawState *st, int gpu_vs
     stg[0].module = gpu_vsh ? c->vs_vsh : c->vs; stg[1].module = st->w_buffer ? c->fs_wdepth : c->fs;
     if (key[7] & 4u)
         stg[1].module = c->fs_a2c;
+    if (key[7] & 16u)
+        stg[1].module = c->fs_tags[(key[7] & 4u) ? 2 : st->w_buffer ? 1 : 0];
     for (i = 0; i < 8; i++) {
         at[i].location = (uint32_t)i; at[i].binding = 0;
         at[i].format = VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -983,7 +1020,25 @@ static VkPipeline get_pipeline(VkrContext *c, const VkrDrawState *st, int gpu_vs
     ms.rasterizationSamples = (VkSampleCountFlagBits)(c->msaa > 1 && !(key[7] & 8u) ? c->msaa : 1);
     ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
     cba[0].colorWriteMask = st->write_mask & 0xF;
-    if (st->blend_enable) {
+    if (key[7] & 16u) {
+        /* AO tags: colour blends with the real alpha (second source), alpha
+         * takes the tag; a draw that writes no colour leaves both alone */
+        cba[0].blendEnable = VK_TRUE;
+        if (st->blend_enable) {
+            cba[0].srcColorBlendFactor = src1_factor(blend_factor(st->blend_src));
+            cba[0].dstColorBlendFactor = src1_factor(blend_factor(st->blend_dst));
+            cba[0].colorBlendOp = blend_op(st->blend_eq);
+        } else {
+            cba[0].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            cba[0].dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+            cba[0].colorBlendOp = VK_BLEND_OP_ADD;
+        }
+        cba[0].srcAlphaBlendFactor = (key[7] & 32u) ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ZERO;
+        cba[0].dstAlphaBlendFactor = (key[7] & 32u) ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
+        cba[0].alphaBlendOp = VK_BLEND_OP_ADD;
+        if (cba[0].colorWriteMask & 7u)
+            cba[0].colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
+    } else if (st->blend_enable) {
         cba[0].blendEnable = VK_TRUE;
         cba[0].srcColorBlendFactor = cba[0].srcAlphaBlendFactor = blend_factor(st->blend_src);
         cba[0].dstColorBlendFactor = cba[0].dstAlphaBlendFactor = blend_factor(st->blend_dst);
@@ -1119,6 +1174,11 @@ VkrContext *vkr_create(void)
         static VkPhysicalDeviceFeatures en;
         vkGetPhysicalDeviceFeatures(c->phys, &pf);
         vkGetPhysicalDeviceProperties(c->phys, &pp);
+        if (pf.dualSrcBlend) {          /* RECOMP_AO tags */
+            en.dualSrcBlend = VK_TRUE;
+            di.pEnabledFeatures = &en;
+            c->dual_src = 1;
+        }
         if (pf.wideLines) {             /* lines as wide as the scale */
             en.wideLines = VK_TRUE;
             di.pEnabledFeatures = &en;
@@ -1228,6 +1288,14 @@ VkrContext *vkr_create(void)
     scene_config(c);
     if (c->scene && !make_scene(c))
         c->scene = 0;
+    /* AO tags: the scene pass tells ground from objects from riders and
+     * particles by them (AO, and motion blur leaving riders sharp);
+     * RECOMP_AO_TAGS=0 off */
+    {
+        const char *e = getenv("RECOMP_AO_TAGS");
+        c->tags = c->scene && (c->sc_p[0] > 0.0f || c->sc_p[4] > 0.0f) && c->dual_src && !(e && *e == '0');
+        fprintf(stderr, "[VKR] AO tags %s\n", c->tags ? "on" : c->dual_src ? "off" : "off (no dualSrcBlend)");
+    }
     post_config(c);
     if (c->post && !make_post(c))
         c->post = 0;
@@ -1425,6 +1493,8 @@ void vkr_destroy(VkrContext *c)
     if (c->post_dsl) vkDestroyDescriptorSetLayout(c->dev, c->post_dsl, NULL);
     if (c->post_fs) vkDestroyShaderModule(c->dev, c->post_fs, NULL);
     vkDestroyShaderModule(c->dev, c->fs_a2c, NULL);
+    for (int i = 0; i < 3; i++)
+        if (c->fs_tags[i]) vkDestroyShaderModule(c->dev, c->fs_tags[i], NULL);
     if (c->sc_pipe) vkDestroyPipeline(c->dev, c->sc_pipe, NULL);
     if (c->sc_pipe_ms) vkDestroyPipeline(c->dev, c->sc_pipe_ms, NULL);
     if (c->sc_ao_pipe) vkDestroyPipeline(c->dev, c->sc_ao_pipe, NULL);
@@ -2201,7 +2271,7 @@ static void push_draw(VkrContext *c, const VkrDrawState *st)
 {
     float pcv[8], gw = (float)c->w, gh = (float)c->h, zmax = c->zmax, scale = c->scale;
     float sq[2] = {c->squeeze2d, c->squeeze_all};
-    uint32_t pcf[5], samples = c->msaa > 1 ? c->msaa : 1;
+    uint32_t pcf[6], samples = c->msaa > 1 ? c->msaa : 1;
     if (c->cur_rt >= 0) {
         const VkrRT *r = &c->rts[c->cur_rt];
         gw = (float)r->gw; gh = (float)r->gh; zmax = r->zmax > 0.0f ? r->zmax : 1.0f;
@@ -2227,7 +2297,13 @@ static void push_draw(VkrContext *c, const VkrDrawState *st)
     pcf[4] = samples << 8;              /* xbox.frag flags */
     if (c->texsmooth && !c->ab_off)
         pcf[4] |= 0x10000u;
-    vkCmdPushConstants(c->cmd, c->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 64, 20, pcf);
+    /* RECOMP_AO_TAGS=prog: every main-target draw in a colour of its vertex
+     * program (which program draws what) */
+    if (c->tag_debug && c->cur_rt < 0)
+        pcf[4] |= 0x100000u;
+    pcf[4] |= (uint32_t)(st->ao_class & 3) << 17;
+    pcf[5] = st->prog;
+    vkCmdPushConstants(c->cmd, c->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 64, 24, pcf);
 }
 
 int vkr_draw(VkrContext *c, const VkrVertex *v, uint32_t nverts,
@@ -2706,7 +2782,7 @@ static void scene_pass(VkrContext *c, int mid)
     VkDescriptorImageInfo ii[3];
     VkDescriptorBufferInfo bi;
     VkWriteDescriptorSet wr[4];
-    float u[68];
+    float u[72];
     uint32_t off = (c->buf_used + 255) & ~255u, k;
     if (off + sizeof u > VKR_BUF_BYTES)
         return;
@@ -2724,11 +2800,12 @@ static void scene_pass(VkrContext *c, int mid)
     u[64] = (float)c->sc_aw; u[65] = (float)c->sc_ah;
     u[66] = (float)((long long)vkr_now_ms() % 100000) * 1e-3f;
     {
-        /* RECOMP_SCENE_DEBUG: 1 AO, 2 normals, 3 distance (scene.frag) */
+        /* RECOMP_SCENE_DEBUG: 1 AO, 2 normals, 3 distance, 4 AO tags (scene.frag) */
         static int dbg = -1;
         if (dbg < 0) { const char *e = getenv("RECOMP_SCENE_DEBUG"); dbg = e ? atoi(e) : 0; }
         u[67] = (float)dbg;
     }
+    u[68] = c->sc_p[13]; u[69] = c->sc_p[14]; u[70] = c->sc_p[15]; u[71] = 0.0f;   /* dof */
     memcpy(c->buf_map + off, u, sizeof u);
     c->buf_used = off + (uint32_t)sizeof u;
 

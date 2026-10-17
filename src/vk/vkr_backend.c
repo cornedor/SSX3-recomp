@@ -922,6 +922,49 @@ static int cam_program(uint32_t hash)
     return 0;
 }
 
+/* Program lists from the environment (hex, comma separated), with a default. */
+static int prog_list(const char *env, const char *def, uint32_t *out, int max)
+{
+    const char *l = getenv(env);
+    int n = 0;
+    if (!l) l = def;
+    while (*l && n < max) {
+        char *end;
+        uint32_t v = (uint32_t)strtoul(l, &end, 16);
+        if (end == l) break;
+        out[n++] = v;
+        l = *end == ',' ? end + 1 : end;
+    }
+    return n;
+}
+
+/* AO tags: the class of a draw by its vertex program -- 2 ground (the
+ * terrain programs, RECOMP_SCENE_VSH), 1 solid world object (RECOMP_AO_SOLID,
+ * default F46BE8DC: SSX 3's rocks, trees, rails, signs, gates), 3 rider
+ * (RECOMP_AO_RIDER, default E9FDBED0), 0 the rest (trails, particles, sky,
+ * HUD). Found with RECOMP_AO_TAGS=prog, which colours every draw by its
+ * program. AO: ground receives, solid occludes; motion blur leaves riders
+ * sharp. */
+static int ao_class(uint32_t hash)
+{
+    static int ns = -1, nr;
+    static uint32_t solid[8], rider[8];
+    int i;
+    if (cam_program(hash))
+        return 2;
+    if (ns < 0) {
+        ns = prog_list("RECOMP_AO_SOLID", "F46BE8DC", solid, 8);
+        nr = prog_list("RECOMP_AO_RIDER", "E9FDBED0", rider, 8);
+    }
+    for (i = 0; i < ns; i++)
+        if (solid[i] == hash)
+            return 1;
+    for (i = 0; i < nr; i++)
+        if (rider[i] == hash)
+            return 3;
+    return 0;
+}
+
 static void scene_camera(const VkrDrawState *st, const float *in, const Nv2aVshProgram *p)
 {
     static const double pts[5][3] = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {3, -2, 5}};
@@ -1140,26 +1183,29 @@ static int s_scene_ran;
  * after the first camera): index, w, depth state, blend, vertices.
  * s_sdt: 0 waiting, 1 this frame, 2 done. */
 static int s_sdt;
+static float s_first_z;                 /* z of the draw's first vertex (trace) */
 
 static void scene_trace_draw(float w, const VkrDrawState *st, uint32_t n)
 {
     if (s_sdt != 1)
         return;
-    fprintf(stderr, "[SCENEDRAW] #%u w %.3g depth %d/%d func %X blend %d %X/%X alpha %X n %u stages %05X\n",
-            s_frame_draw_no, w, st->depth_test, st->depth_write, st->depth_func, st->blend_enable,
-            st->blend_src, st->blend_dst, st->alpha_func, n, st->u.stage_program);
+    fprintf(stderr, "[SCENEDRAW] #%u z %.6g w %.3g depth %d/%d func %X blend %d %X/%X alpha %X n %u stages %05X prog %08X\n",
+            s_frame_draw_no, s_first_z, w, st->depth_test, st->depth_write, st->depth_func, st->blend_enable,
+            st->blend_src, st->blend_dst, st->alpha_func, n, st->u.stage_program, st->prog);
 }
 
-static void scene_before_2d(float w)
+static void scene_before_2d(float w, float z)
 {
-    if (!s_cam.valid || s_scene_ran || w != 1.0f)
+    /* w == 1 at the far plane is the backdrop (SSX 3's sky sprites, drawn
+     * between the terrain and the rocks, trees and riders), not the HUD */
+    if (!s_cam.valid || s_scene_ran || w != 1.0f || z >= (float)s_zmax * 0.999f)
         return;
     s_scene_ran = 1;
     {
         static int tr = -1;
         static double last;
         if (tr < 0) tr = getenv("RECOMP_SCENE_TRACE") != NULL;
-        if (tr && now_ms() - last > 1000.0) {
+        if (tr && (s_sdt == 1 || now_ms() - last > 1000.0)) {
             last = now_ms();
             fprintf(stderr, "[SCENE] pass at draw %u of the frame (last frame had %u)\n",
                     s_frame_draw_no, s_frame_draws_last);
@@ -1181,6 +1227,7 @@ static float vsh_first_w(const float *in, const Nv2aVshProgram *p)
             memcpy(vin[a], in + p->in_slot[a] * 4, sizeof vin[a]);
     if (!nv2a_vsh_run((const float (*)[4])vin, &o))
         return 0.0f;
+    s_first_z = o.pos[2];
     return o.pos[3];
 }
 
@@ -1223,8 +1270,9 @@ static int be_draw(const Nv2aTarget *t, uint32_t prim, const Nv2aVshOutput *v, u
         if (s_trace == 2)
             trace_draw(t, prim, v, n, &st);
         if (!t->swizzled && !is_rt(t->color_offset) && n) {
+            s_first_z = v[0].pos[2];
             scene_trace_draw(v[0].pos[3], &st, n);
-            scene_before_2d(v[0].pos[3]);
+            scene_before_2d(v[0].pos[3], v[0].pos[2]);
         }
         t2 = s_stats ? now_ms() : 0;
         vkr_draw(s_vk, (const VkrVertex *)v, n, idx, k, &st);
@@ -1290,11 +1338,13 @@ static int be_draw_vsh(const Nv2aTarget *t, uint32_t prim, const float *in, uint
                 }
             }
         }
+        st.prog = p->hash;
+        st.ao_class = ao_class(p->hash);
         if (s_cam.valid && !t->swizzled && !is_rt(t->color_offset) && n) {
             float w0 = vsh_first_w(in, p);
             scene_trace_draw(w0, &st, n);
             if (!s_scene_ran)
-                scene_before_2d(w0);
+                scene_before_2d(w0, s_first_z);
         }
         t2 = s_stats ? now_ms() : 0;
         if (!vkr_draw_vsh(s_vk, in, n, p->nin, &p->ins[0][0], p->nins, p->hash, p->consts,
@@ -1487,7 +1537,13 @@ static void be_flip(const Nv2aTarget *t)
         if (s_sdt == 1)
             s_sdt = 2;
         else if (tr == 2 && s_sdt == 0 && had_cam) {
-            if (!t0) t0 = now_ms();
+            /* RECOMP_SCENE_TRACE_AT=<ms>: that long after the first race
+             * briefing instead (the same frame as RECOMP_AB=..,b<ms>) */
+            const char *at = getenv("RECOMP_SCENE_TRACE_AT");
+            if (at) {
+                if (ssx3_autonav_briefed && !t0) t0 = now_ms();
+                if (t0 && now_ms() - t0 > atof(at)) s_sdt = 1;
+            } else if (!t0) t0 = now_ms();
             else if (now_ms() - t0 > 3000.0) s_sdt = 1;
         }
     }

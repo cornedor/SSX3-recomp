@@ -94,21 +94,43 @@ word-split `$env` strings: pass env vars literally.
      written back into the multisampled target. Frames without a 2D draw
      get it at the flip. (A per-pixel 3D mask was tried first: HUD quads
      that write depth left un-hazed boxes; removed.) Pixels nearer than `mindist` (120) are skipped.
-   - `RECOMP_AO` (0.8): SAO-style, half resolution, 16 taps, radius 2 m,
-     4x4 depth-aware blur. Only taps that rise above ~20 degrees and 60-120
-     cm above the surface count (trees, rocks, riders, fences): the board
-     trails are separate trough meshes with steep walls and got dark lines
-     along them. A trunk covers few of the taps around its foot, so the
-     per-tap gain is high (`gain`, 12). `RECOMP_SCENE_TRACE=2` lists every
-     draw of one frame (w, depth, blend) -- the pass runs at the first
-     screen-space draw after the world.
+   - `RECOMP_AO` (0.8): SAO-style, half resolution, 16 taps, radius 5 m,
+     4x4 depth-aware blur, soft curve capped at 70% darkening. **AO tags**
+     decide who darkens whom: every main-target draw writes its class into
+     the frame's alpha (xbox.frag `TAGS` variants; the game's real alpha
+     goes to the second blend source -- dual-source blending -- so its
+     blending is unchanged; SSX 3 never blends with destination alpha).
+     Classes by vertex program (`vkr_backend.c` `ao_class`): ground = the
+     terrain programs (`RECOMP_SCENE_VSH`, E4F2B8D0), solid =
+     `RECOMP_AO_SOLID` (F46BE8DC: rocks, trees, rails, signs, gates), the
+     rest (riders, trails, spray, sky, HUD) neither. Only ground receives,
+     only solid occludes. Depth alone (the first version) darkened thin
+     beams and whole rock faces, put halos round riders and spray, and lines
+     along the board trails. `RECOMP_AO_TAGS=prog` colours every draw by its
+     program (to find the classes on another title), `=0` turns tags off
+     (no dualSrcBlend: off too, and then AO receives nothing).
+     The pass runs at the first screen-space draw (w == 1) that is not at
+     the far plane: SSX 3 draws its sky sprites as screen-space quads at the
+     far plane between the terrain and the objects, and they used to start
+     it, so rocks, trees and riders missed every scene effect.
+     `RECOMP_SCENE_TRACE=2` lists every draw of one frame (z, w, depth,
+     blend, program), `RECOMP_SCENE_TRACE_AT=<ms>` that long after the race
+     briefing.
      `RECOMP_HAZE` (0.35, from 50 m): towards the terrain draw's fog colour.
      `RECOMP_SHAFTS` (1): only when the sun is on screen (rare on Snow Jam:
      the sun is 63 degrees up). `RECOMP_RIM` (0.2): sun-side silhouettes
-     nearer than `rimrange`. `RECOMP_MBLUR` (off): reprojection with last
-     frame's camera, not nearer than `near`. Knobs: `RECOMP_SCENE_PARAMS`
-     (radius taps start density rimrange near mindist).
-     `RECOMP_SCENE_DEBUG=1|2|3`: AO, normals, distance.
+     nearer than `rimrange`. `RECOMP_MBLUR` (off; 1 = full frame-to-frame
+     motion): reprojection with last frame's camera, 12 jittered taps, up
+     to 96 px at 1080 lines, right up to the camera (the snow rushing past
+     is where the speed shows); riders (tag 3, `RECOMP_AO_RIDER`, default
+     E9FDBED0) stay sharp and are kept out of the taps. It used to skip
+     everything nearer than 6 m to protect the rider, which left only the
+     background moving. `RECOMP_DOF=<px>` (off; 3 is subtle): far blur,
+     growing from `dofstart` (40 m) to full at `dofend` (250 m), 16-tap
+     disk; taps nearer than `dofstart` are left out, so the rider does not
+     bleed into the blur. Knobs: `RECOMP_SCENE_PARAMS` (radius taps start
+     density rimrange near mindist gain dofstart dofend).
+     `RECOMP_SCENE_DEBUG=1|2|3|4`: AO, normals, distance, AO tags.
    - `RECOMP_TEX_BICUBIC=1` (not in the preset): Catmull-Rom for magnified
      linear textures. Crisper, but it also brings out the DXT blocks; not a
      clear win on these textures.

@@ -16,7 +16,30 @@ let audio = null;                    // { ctx, node }
 // ---------------------------------------------------------------- log
 const logLines = [];
 let logDirty = false;
+// ?report: send the log and periodic canvas shots to tools/serve_web.py --sink
+// (headless test runs). ?shots=N: a shot every N seconds (default 10).
+const report = new URLSearchParams(location.search).has('report');
+let reportBuf = [];
+if (report) {
+  setInterval(() => {
+    if (!reportBuf.length) return;
+    const body = reportBuf.join('\n') + '\n';
+    reportBuf = [];
+    fetch('report/log', { method: 'POST', body }).catch(() => {});
+  }, 500);
+  const every = +(new URLSearchParams(location.search).get('shots') || 10);
+  let n = 0;
+  setInterval(() => {
+    if (!mod) return;
+    const t = Math.round(performance.now() / 1000);
+    canvas.toBlob((b) => b && fetch(`report/shot?name=t${String(t).padStart(4, '0')}`,
+      { method: 'POST', body: b }).catch(() => {}), 'image/png');
+    n++;
+  }, every * 1000);
+}
 function log(line) {
+  if (!line.startsWith("[GAME]")) console.log(line);
+  if (report) reportBuf.push(line);
   logLines.push(line);
   if (logLines.length > 400) logLines.splice(0, logLines.length - 400);
   logDirty = true;
@@ -29,7 +52,11 @@ setInterval(() => {
   if (atEnd) logEl.scrollTop = logEl.scrollHeight;
 }, 250);
 
+addEventListener('error', (e) => log(`[PAGE] error: ${e.message} (${e.filename}:${e.lineno})\n${e.error && e.error.stack || ''}`));
+addEventListener('unhandledrejection', (e) => log(`[PAGE] unhandled: ${e.reason && (e.reason.stack || e.reason)}`));
+
 function say(html, { progress = null, buttons = [] } = {}) {
+  if (progress === null) log('[PAGE] ' + html.replace(/<[^>]+>/g, ''));
   overlay.hidden = false;
   msg.innerHTML = html;
   prog.hidden = progress === null;
@@ -235,7 +262,8 @@ async function startAudio() {
     const node = new AudioWorkletNode(ac, 'ring-player', { outputChannelCount: [2] });
     node.port.postMessage({ buffer: mod.HEAPU8.buffer, ring: mod._web_audio_ring() });
     node.connect(ac.destination);
-    await ac.resume();
+    // Without a user gesture (autostart) resume() can wait forever.
+    await Promise.race([ac.resume(), new Promise((r) => setTimeout(r, 1000))]);
     audio = { ctx: ac, node };
     $('mute').disabled = false;
   } catch (e) {
@@ -265,9 +293,24 @@ async function start() {
   overlay.dataset.keep = '';
   const env = envFromQuery();
   mod = await SSX3({
-    print: (t) => { console.log(t); log(t); },
-    printErr: (t) => { console.log(t); log(t); },
+    print: (t) => log(t),
+    printErr: (t) => log(t),
     preRun: [(m) => { Object.assign(m.ENV, env); }],
+    // The title ended (ExitProcess): a reboot -- the first boot formats the
+    // emulated cache partition and relaunches -- or a quit to the dashboard.
+    // Restart it; twice within 20 s would be a loop, so stop then.
+    onGuestExit: (code) => {
+      const last = +(sessionStorage.getItem('ssx3-exit') || 0);
+      log(`[PAGE] title exited (${code}), restarting`);
+      if (Date.now() - last < 20000) {
+        say('<span class="bad">The game exited twice in a row.</span> See the log.');
+        return;
+      }
+      sessionStorage.setItem('ssx3-exit', String(Date.now()));
+      const q = new URLSearchParams(location.search);
+      q.set('autostart', '');
+      setTimeout(() => { location.search = q.toString(); }, 300);
+    },
   });
   info = mod._malloc(32);
   new Int32Array(mod.HEAPU8.buffer, info, 8).fill(0);

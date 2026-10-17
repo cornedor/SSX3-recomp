@@ -116,6 +116,7 @@ elseif(EMSCRIPTEN)
     # thread's view would have to follow. Guest memory is ~155 MB of it.
     set_target_properties(${PROJECT_NAME} PROPERTIES SUFFIX ".js")
     target_link_options(${PROJECT_NAME} PRIVATE
+        --profiling-funcs
         -sPROXY_TO_PTHREAD=1
         -sINITIAL_MEMORY=2GB
         -sALLOW_MEMORY_GROWTH=0

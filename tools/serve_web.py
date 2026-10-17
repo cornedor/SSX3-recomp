@@ -12,6 +12,10 @@ on this machine:
 the page offers to copy it from there (or does so at once with
 ?import=server): handy for automated runs, where no one picks a folder.
 
+--sink DIR accepts what a page started with ?report sends back: its log
+(POST /report/log, appended to DIR/web_log.txt) and canvas screenshots
+(POST /report/shot?name=N, DIR/N.png) -- so headless runs need no driver.
+
 The page and module contain SSX 3's recompiled code: serve them to yourself
 only (the default bind is loopback).
 """
@@ -26,6 +30,7 @@ import os
 import urllib.parse
 
 GAME_DIR = None
+SINK_DIR = None
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -61,6 +66,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
+    def do_POST(self):
+        u = urllib.parse.urlsplit(self.path)
+        if not SINK_DIR or not u.path.startswith("/report/"):
+            self.send_error(404)
+            return
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if u.path == "/report/log":
+            with open(os.path.join(SINK_DIR, "web_log.txt"), "ab") as f:
+                f.write(body)
+        elif u.path == "/report/shot":
+            name = urllib.parse.parse_qs(u.query).get("name", ["shot"])[0]
+            name = "".join(c for c in name if c.isalnum() or c in "-_") or "shot"
+            with open(os.path.join(SINK_DIR, name + ".png"), "wb") as f:
+                f.write(body)
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        if not SINK_DIR:
+            super().log_message(fmt, *args)
+
     def end_headers(self):
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
@@ -76,8 +102,12 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--game", help="your rip (default.xbe + data/) to offer under /game/")
+    ap.add_argument("--sink", help="directory for ?report logs and screenshots")
     a = ap.parse_args()
-    global GAME_DIR
+    global GAME_DIR, SINK_DIR
+    if a.sink:
+        SINK_DIR = os.path.realpath(a.sink)
+        os.makedirs(SINK_DIR, exist_ok=True)
     if a.game:
         GAME_DIR = os.path.realpath(a.game)
     handler = functools.partial(Handler, directory=a.dir)

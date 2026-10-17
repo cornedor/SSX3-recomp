@@ -482,6 +482,73 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
     return EXCEPTION_CONTINUE_SEARCH;
 }
+#elif defined(__EMSCRIPTEN__)
+
+/* Web: no faults. Every guest 8/16/32-bit access to the MCPX span
+ * (0xFE800000-0xFEFFFFFF) arrives here from the checked accessors in
+ * recomp_types.h; what no device owns is plain memory, as natively. */
+#include <unistd.h>
+
+extern uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
+extern void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
+extern int xbox_OhciMmioAccess(uint32_t xbox_va, int is_write, uint64_t *val, int size);
+extern int xbox_OhciOwnsAddress(uint32_t xbox_va);
+extern void *xbox_GuestToHost(uint32_t va);
+
+#define APU_MMIO_BASE 0xFE800000u
+/* Natively only the first 0x30000 bytes are unmapped (the toolkit's
+ * APU_TRAP_BYTES); the GP/EP DSP memory above stays plain RAM. */
+#define APU_MMIO_END  0xFE830000u
+#define AC97_BASE     0xFEC00000u
+
+uint32_t xbox_mmio_read(uint32_t va, int size)
+{
+    uint8_t *p;
+    uint64_t v = 0;
+
+    if (g_apu_state && va >= APU_MMIO_BASE && va < APU_MMIO_END)
+        return (uint32_t)mcpx_apu_mmio_read(g_apu_state, va - APU_MMIO_BASE, (unsigned)size);
+    if (xbox_OhciOwnsAddress(va)) {
+        xbox_OhciMmioAccess(va, 0, &v, size);
+        return (uint32_t)v;
+    }
+    p = (uint8_t *)xbox_GuestToHost(va);
+    return size == 1 ? *(volatile uint8_t *)p
+         : size == 2 ? *(volatile uint16_t *)p : *(volatile uint32_t *)p;
+}
+
+void xbox_mmio_write(uint32_t va, uint32_t val, int size)
+{
+    uint8_t *p;
+    uint64_t v = val;
+
+    if (g_apu_state && va >= APU_MMIO_BASE && va < APU_MMIO_END) {
+        mcpx_apu_mmio_write(g_apu_state, va - APU_MMIO_BASE, val, (unsigned)size);
+        return;
+    }
+    if (xbox_OhciOwnsAddress(va)) {
+        xbox_OhciMmioAccess(va, 1, &v, size);
+        return;
+    }
+    p = (uint8_t *)xbox_GuestToHost(va);
+    if (size == 1)      *(volatile uint8_t *)p = (uint8_t)val;
+    else if (size == 2) *(volatile uint16_t *)p = (uint16_t)val;
+    else                *(volatile uint32_t *)p = val;
+    /* AC'97 bus-master reset (RR, bit 1 of each channel's control byte):
+     * the XDK sets it and waits for the controller to clear it. */
+    if (va >= AC97_BASE && va < AC97_BASE + 0x1000u) {
+        uint32_t off;
+        for (off = 0x10B; off < 0x180; off += 0x10) {
+            volatile uint8_t *r = (volatile uint8_t *)xbox_GuestToHost(AC97_BASE + off);
+            if (*r & 0x02)
+                *r = (uint8_t)(*r & ~0x02);
+        }
+    }
+}
+
+static void ac97_arm(void) {}
+static void install_crash_handler(void) {}
+
 #else /* !_WIN32 */
 
 #include <signal.h>
@@ -1215,11 +1282,42 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
     return TRUE;
 }
 
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/wasmfs.h>
+#include <sys/stat.h>
+
+/* The page (web/) copies the user's rip into the origin-private file system
+ * once, as ssx3/game/; this mounts OPFS at /opfs, where saves and the
+ * emulated hard disk persist too. main() runs on a worker (PROXY_TO_PTHREAD),
+ * which the OPFS backend needs for its synchronous access handles. */
+static void web_setup(void)
+{
+    backend_t opfs = wasmfs_create_opfs_backend();
+
+    if (!opfs || wasmfs_create_directory("/opfs", 0777, opfs) != 0)
+        fprintf(stderr, "[WEB] could not mount OPFS at /opfs\n");
+    mkdir("/opfs/ssx3", 0777);
+    mkdir("/opfs/ssx3/saves", 0777);
+    mkdir("/opfs/ssx3/system", 0777);
+    /* The page can set any of these through ?env=NAME=value. */
+    setenv("RECOMP_GAME_DIR", "/opfs/ssx3/game", 0);
+    setenv("RECOMP_SAVE_DIR", "/opfs/ssx3/saves", 0);
+    setenv("RECOMP_SYSTEM_DIR", "/opfs/ssx3/system", 0);
+    /* The software rasteriser draws 640x480 4:3; nothing un-squeezes a
+     * widened camera. */
+    setenv("RECOMP_WIDESCREEN", "0", 0);
+    setenv("RECOMP_KEYBOARD", "1", 0);
+}
+#endif
+
 /* Console entry point (for debugging -- lets you see printf output) */
 int main(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
+#if defined(__EMSCRIPTEN__)
+    web_setup();
+#endif
 #ifdef _WIN32
     return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
 #else

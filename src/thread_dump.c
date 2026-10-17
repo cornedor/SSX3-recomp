@@ -28,12 +28,22 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <pthread.h>
+#if !defined(__EMSCRIPTEN__)
 #include <execinfo.h>
 #include <sys/syscall.h>
+#endif
 
 #include "recomp/gen/recomp_types.h"
 extern void print_guest_stack(void);
 
+#if defined(__EMSCRIPTEN__)
+/* Web: no per-thread signals or native backtraces of other threads. */
+void ssx3_ThreadDumpStart(void)
+{
+    if (getenv("RECOMP_THREAD_DUMP_SECS"))
+        fprintf(stderr, "[THREADS] thread dumps are not available on the web build\n");
+}
+#else
 static volatile sig_atomic_t s_dump_done;
 
 static void dump_handler(int sig)
@@ -111,6 +121,7 @@ void ssx3_ThreadDumpStart(void)
     pthread_create(&t, NULL, dump_thread, (void *)(intptr_t)(v ? atoi(v) : 0));
     pthread_detach(t);
 }
+#endif /* __EMSCRIPTEN__ */
 extern void xbox_PeekSample(const char *label);
 
 static void *peek_thread(void *arg)

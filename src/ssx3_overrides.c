@@ -188,7 +188,7 @@ void sub_0024EA13(void)
         memcpy(&aspect, &bits, 4);
         aspect *= ssx3_Aspect() * 0.75f;
         memcpy(&bits, &aspect, 4);
-        MEM32(g_esp + 12) = bits;
+        ST32(g_esp + 12, bits);
     }
     sub_0024EA13_gen();
 }
@@ -219,16 +219,16 @@ void sub_0009C7A0(void)
     }
     if (on && obj >= 0x10000u) {
         old = MEM32(obj + 0x18);
-        MEM32(obj + 0x18) = 0x5EADBEEFu;
+        ST32(obj + 0x18, 0x5EADBEEFu);
     }
     sub_0009C7A0_gen();
     if (on && obj >= 0x10000u) {
         if (MEM32(obj + 0x18) == 0) {
-            MEM32(obj + 0x18) = 1;
+            ST32(obj + 0x18, 1);
             fprintf(stderr, "[DEBUGMENU] title handler: quick start selected (obj %08X)\n", obj);
             fflush(stderr);
         } else if (MEM32(obj + 0x18) == 0x5EADBEEFu) {
-            MEM32(obj + 0x18) = old;
+            ST32(obj + 0x18, old);
         }
     }
 }
@@ -307,7 +307,7 @@ void sub_000E1B90(void)
         on = e && *e && *e != '0';
     }
     if (on && app >= 0x10000u && !MEM8(app + 0x60) && MEM32(0x0036843Cu) == 0x27) {
-        MEM8(app + 0x60) = 1;
+        ST8(app + 0x60, 1);
         fprintf(stderr, "[DEBUGMENU] lodge requested: real frontend from now on\n");
         fflush(stderr);
     }
@@ -422,7 +422,7 @@ int ssx3_lensfx_nowait;
 void sub_001F8760(void)
 {
     if (ssx3_lensfx_nowait)
-        MEM8(g_esp + 16) = 0;
+        ST8(g_esp + 16, 0);
     sub_001F8760_gen();
 }
 
@@ -513,7 +513,7 @@ void sub_00239B76(void)
 {
     uint32_t ramp = MEM32(g_esp + 4);
     if (ramp) {
-        const uint8_t *p = (const uint8_t *)&MEM8(ramp);
+        const uint8_t *p = (const uint8_t *)XBOX_PTR(ramp);
         xbox_FramebufferSetGammaRamp(p, p + 256, p + 512);
     }
     sub_00239B76_gen();
@@ -813,7 +813,7 @@ void sub_0020C740(void)
         if (!done++)
             for (k = 0; k < 3; k++)
                 if (MEM32(counts[k]))
-                    MEM32(counts[k]) += (uint32_t)extra;
+                    ST32(counts[k], MEM32(counts[k]) + (uint32_t)extra);
     }
     s_pool_obj = g_ecx;
     sub_0020C740_gen();
@@ -949,7 +949,7 @@ void sub_0017A5A0(void)
         }
         if (force && tab && fd < MEM32(0x0039E880u) && MEM32(ent) != 0) {
             uint32_t want = MEM32(g_esp + 12);
-            MEM32(ent + 4) = (base ? base - want : want) ^ 1;
+            ST32(ent + 4, (base ? base - want : want) ^ 1);
         }
     }
     if (log) {

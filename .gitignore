@@ -87,3 +87,5 @@ game
 /save/
 /keys.ini
 dist/
+disk
+build-web/

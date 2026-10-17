@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSX 3 Recomp</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #30363d; --fg: #e6edf3;
+    --muted: #8b949e; --accent: #4fb3ff; --warn: #f0b429; --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; }
+  header { width: 100%; max-width: 1000px; padding: 16px; display: flex;
+    align-items: baseline; gap: 12px; }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .02em; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  main { width: 100%; max-width: 1000px; padding: 0 16px 16px; display: flex;
+    flex-direction: column; gap: 12px; }
+  .stage { position: relative; width: 100%; aspect-ratio: 4 / 3; background: #000;
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  canvas { width: 100%; height: 100%; display: block; image-rendering: auto; }
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; padding: 24px;
+    text-align: center; background: rgba(13,17,23,.92); }
+  .overlay[hidden] { display: none; }
+  .overlay p { margin: 0; max-width: 560px; color: var(--muted); }
+  .overlay strong { color: var(--fg); }
+  button, label.btn { appearance: none; border: 1px solid var(--line); background: var(--panel);
+    color: var(--fg); padding: 9px 16px; border-radius: 6px; font: inherit; cursor: pointer; }
+  button.primary, label.btn.primary { background: var(--accent); border-color: var(--accent);
+    color: #04111d; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  progress { width: min(420px, 90%); height: 8px; accent-color: var(--accent); }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .bar .stat { color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  summary { padding: 8px 12px; cursor: pointer; color: var(--muted); }
+  pre#log { margin: 0; padding: 8px 12px; max-height: 260px; overflow: auto;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: #c9d1d9;
+    white-space: pre-wrap; word-break: break-all; border-top: 1px solid var(--line); }
+  table.keys { border-collapse: collapse; margin: 8px 12px 12px; font-size: 13px; }
+  table.keys td { padding: 2px 14px 2px 0; }
+  table.keys td:first-child { color: var(--muted); }
+  kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--line);
+    border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; background: var(--bg); }
+  .warn { color: var(--warn); }
+  .bad { color: var(--bad); }
+  :fullscreen .stage, .stage:fullscreen { border: 0; border-radius: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SSX 3</h1>
+  <span class="sub">static recompilation, WebAssembly build</span>
+</header>
+<main>
+  <div class="stage" id="stage">
+    <canvas id="screen" width="640" height="480"></canvas>
+    <div class="overlay" id="overlay">
+      <p id="msg">Checking the browser…</p>
+      <progress id="prog" max="1" value="0" hidden></progress>
+      <div class="row" id="actions"></div>
+    </div>
+  </div>
+  <div class="bar">
+    <button id="fs" disabled>Fullscreen</button>
+    <button id="mute" disabled>Mute</button>
+    <button id="replace">Replace game files…</button>
+    <span class="stat" id="stat"></span>
+  </div>
+  <details>
+    <summary>Controls</summary>
+    <table class="keys">
+      <tr><td>Steer / menus</td><td><kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd> (d-pad), numpad <kbd>4</kbd><kbd>6</kbd><kbd>8</kbd><kbd>2</kbd> (left stick)</td></tr>
+      <tr><td>A / B / X / Y</td><td><kbd>Z</kbd> <kbd>X</kbd> <kbd>A</kbd> <kbd>S</kbd></td></tr>
+      <tr><td>Start / Back</td><td><kbd>Enter</kbd> <kbd>Backspace</kbd></td></tr>
+      <tr><td>Black / White</td><td><kbd>E</kbd> <kbd>Q</kbd></td></tr>
+      <tr><td>Left / right trigger</td><td><kbd>1</kbd> <kbd>3</kbd></td></tr>
+      <tr><td>Right stick</td><td><kbd>J</kbd> <kbd>L</kbd> <kbd>I</kbd> <kbd>K</kbd></td></tr>
+      <tr><td>Gamepad</td><td>any standard-mapped pad (Xbox layout), press a button once to connect it</td></tr>
+    </table>
+  </details>
+  <details>
+    <summary>Log</summary>
+    <pre id="log"></pre>
+  </details>
+</main>
+<input type="file" id="pick" webkitdirectory directory multiple hidden>
+<script src="ssx3_recomp.js"></script>
+<script src="main.js"></script>
+</body>
+</html>

@@ -25,6 +25,13 @@ add_compile_definitions(
     NOMINMAX
 )
 
+# WebAssembly (emcmake cmake ..., see docs/WEB.md): every guest and host
+# thread is a pthread, so the whole tree is built with shared memory.
+if(EMSCRIPTEN)
+    add_compile_options(-pthread)
+    add_link_options(-pthread)
+endif()
+
 # ── xboxrecomp toolkit ──────────────────────────────────────────
 #
 # Option A: xboxrecomp as a subdirectory (simplest)
@@ -61,6 +68,7 @@ set(GAME_SOURCES
     src/game_state.c
     src/autonav.c
     src/mmio_posix.c
+    src/web_platform.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -100,6 +108,36 @@ if(WIN32)
         # function's symbol, i.e. to the guest function that faulted.
         dbghelp
     )
+elseif(EMSCRIPTEN)
+    # main() runs on a worker (PROXY_TO_PTHREAD): guest code blocks freely and
+    # the browser thread stays free for input, audio and presenting. Guest
+    # call chains are native call chains, so threads get deep stacks.
+    # One fixed 2 GB memory: growing a shared memory is slow, and every
+    # thread's view would have to follow. Guest memory is ~155 MB of it.
+    set_target_properties(${PROJECT_NAME} PROPERTIES SUFFIX ".js")
+    target_link_options(${PROJECT_NAME} PRIVATE
+        -sPROXY_TO_PTHREAD=1
+        -sINITIAL_MEMORY=2GB
+        -sALLOW_MEMORY_GROWTH=0
+        -sSTACK_SIZE=8MB
+        -sDEFAULT_PTHREAD_STACK_SIZE=4MB
+        -sPTHREAD_POOL_SIZE=40
+        -sWASMFS=1
+        -sENVIRONMENT=web,worker
+        -sMODULARIZE=1
+        -sEXPORT_NAME=SSX3
+        -sEXIT_RUNTIME=0
+        -sINVOKE_RUN=0
+        -sEXPORTED_FUNCTIONS=_main,_web_key,_web_pad,_web_frame,_web_audio_ring,_malloc,_free
+        -sEXPORTED_RUNTIME_METHODS=HEAPU8,ENV,callMain
+    )
+    # The page next to the module: build-web/ is what tools/serve_web.py serves.
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/web/index.html
+            ${CMAKE_CURRENT_SOURCE_DIR}/web/main.js
+            ${CMAKE_CURRENT_SOURCE_DIR}/web/audio-worklet.js
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>)
 else()
     target_link_libraries(${PROJECT_NAME} PRIVATE m pthread dl)
     # Symbol names (sub_XXXXXXXX) in the crash handler's backtrace.
@@ -108,7 +146,12 @@ endif()
 
 # Vulkan renderer for the NV2A executor (RECOMP_GPU=vk), see docs/VULKAN.html.
 # Both hosts; on Windows it needs the Vulkan SDK (tools\build.bat finds it).
-option(SSX3_VULKAN "Build the Vulkan renderer" ON)
+if(EMSCRIPTEN)
+    set(SSX3_VULKAN_DEFAULT OFF)
+else()
+    set(SSX3_VULKAN_DEFAULT ON)
+endif()
+option(SSX3_VULKAN "Build the Vulkan renderer" ${SSX3_VULKAN_DEFAULT})
 if(SSX3_VULKAN)
     add_subdirectory(src/vk ${CMAKE_BINARY_DIR}/vk)
     target_sources(${PROJECT_NAME} PRIVATE src/vk/vkr_backend.c)

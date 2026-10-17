@@ -12,8 +12,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TK="$(dirname "$HERE")/xboxrecomp"
-PY="$TK/.venv/bin/python"
+TK="${TK:-$(dirname "$HERE")/xboxrecomp}"
+PY="${PY:-$TK/.venv/bin/python}"
 if [ -z "${XBE:-}" ]; then
     XBE="$(dirname "$HERE")/SSX3/default.xbe"
     [ -f "$XBE" ] || XBE="$HERE/disk/SSX3/default.xbe"
@@ -42,3 +42,7 @@ fi
 "$PY" -m tools.recomp "$XBE" --all --split 250 --game-name "SSX 3" \
     --gen-dir "$HERE/src/recomp/gen" \
     --exclude-manual "$HERE/src/ssx3_overrides.c"
+# Stores through MEMn become explicit STn(addr, value): the wasm build checks
+# device addresses on every access and needs MEMn to be an rvalue (see the
+# script). Same meaning natively.
+python3 "$HERE/tools/explicit_stores.py" "$HERE"/src/recomp/gen/*.c

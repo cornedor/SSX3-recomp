@@ -8602,10 +8602,10 @@ index 0000000..748ee10
 +#endif /* !_WIN32 */
 diff --git a/src/video/fb_present_web.c b/src/video/fb_present_web.c
 new file mode 100644
-index 0000000..08c6f92
+index 0000000..9b7ce12
 --- /dev/null
 +++ b/src/video/fb_present_web.c
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,268 @@
 +/**
 + * Browser counterpart of fb_present_sdl.c: the guest framebuffer for a page.
 + *
@@ -8702,9 +8702,13 @@ index 0000000..08c6f92
 +    uint32_t bpp, y;
 +    size_t n = (size_t)s_fb_width * s_fb_height;
 +
++    static int gpu = -1;
++
 +    if (!s_fb_running || !fb_va || !pitch)
 +        return;
-+    if (getenv("RECOMP_FB_VA"))
++    if (gpu < 0)        /* the page's WebGPU renderer shows its frames itself */
++        gpu = getenv("RECOMP_WEBGPU") != NULL && !(getenv("RECOMP_GPU") && *getenv("RECOMP_GPU") == 's');
++    if (gpu || getenv("RECOMP_FB_VA"))
 +        return;
 +    next = (s_present_idx == 0) ? 1 : 0;
 +    if (!s_present[next]) {

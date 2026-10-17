@@ -4,7 +4,9 @@
 
 const $ = (id) => document.getElementById(id);
 const overlay = $('overlay'), msg = $('msg'), prog = $('prog'), actions = $('actions');
-const canvas = $('screen'), ctx2d = canvas.getContext('2d', { alpha: false });
+const canvas = $('screen');
+let ctx2d = null;                    // software frames (no WebGPU)
+let gpu = null;                      // the WebGPU renderer (gpu.js)
 const logEl = $('log'), stat = $('stat');
 
 const SSX3_TITLE_ID = 0x4541003C;    // PAL, XDK 5558
@@ -243,9 +245,10 @@ function frame() {
     }
     // ImageData cannot view a SharedArrayBuffer: copy.
     image.data.set(new Uint8Array(mod.HEAPU8.buffer, ptr, w * h * 4));
+    if (!ctx2d) ctx2d = canvas.getContext('2d', { alpha: false });
     ctx2d.putImageData(image, 0, 0);
-    if (!overlay.hidden && !overlay.dataset.keep) overlay.hidden = true;
   }
+  if ((ptr || (gpu && gpu.frames)) && !overlay.hidden && !overlay.dataset.keep) overlay.hidden = true;
   const now = performance.now();
   if (now - fpsT >= 1000) {
     const flips = i32[3];
@@ -288,11 +291,26 @@ function envFromQuery() {
   return env;
 }
 
+if (new URLSearchParams(location.search).has('hb')) setInterval(() => log('[HB] ' + Math.round(performance.now())), 1000);
+
 async function start() {
   say('Starting…', { progress: null });
   overlay.dataset.keep = '';
   const env = envFromQuery();
+  // WebGPU unless ?gpu=sw (or RECOMP_GPU=sw): the software rasteriser is the
+  // fallback when the browser has no adapter.
+  if (params.get('gpu') !== 'sw' && env.RECOMP_GPU !== 'sw') {
+    try {
+      gpu = await WebGPURenderer.create(canvas, log);
+    } catch (e) {
+      log('[WEBGPU] unavailable: ' + (e.message || e));
+      gpu = null;
+    }
+    if (gpu) env.RECOMP_WEBGPU = '1';
+    else log('[WEBGPU] no adapter: software rasteriser');
+  }
   mod = await SSX3({
+    wgrAttach: (ctl) => (gpu ? gpu.attach(mod, ctl) : false),
     print: (t) => log(t),
     printErr: (t) => log(t),
     preRun: [(m) => { Object.assign(m.ENV, env); }],

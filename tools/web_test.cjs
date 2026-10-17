@@ -28,8 +28,11 @@ const keys = arg('keys', '');   // "t:Key,t:Key" -- press Key (KeyboardEvent.key
     '--port', String(port), '--game', path.join(root, 'disk/SSX3')], { stdio: 'ignore' });
   await new Promise((r) => setTimeout(r, 800));
   const ctx = await chromium.launchPersistentContext(path.join(root, 'work/pw-profile'), {
-    headless: true, viewport: { width: 1000, height: 900 },
-    args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-swiftshader'],
+    // Full Chromium in new-headless mode: unlike the headless shell it has a
+    // WebGPU adapter on the real GPU (Vulkan).
+    headless: true, channel: 'chromium', viewport: { width: 1000, height: 900 },
+    args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu',
+           '--enable-features=Vulkan', '--use-angle=vulkan'],
   });
   let shot = 0;
   const finish = async (why) => {
@@ -42,11 +45,29 @@ const keys = arg('keys', '');   // "t:Key,t:Key" -- press Key (KeyboardEvent.key
   };
   const page = ctx.pages()[0] || await ctx.newPage();
   page.on('console', (m) => w(m.text()));
+  // Workers' own console (pthreads print through the page thread, so this
+  // only shows what bypasses it -- useful when the page thread is stuck).
+  if (process.argv.includes('--workers'))
+    page.on('worker', (wk) => wk.on('console', (m) => w('[W] ' + m.text())));
   page.on('pageerror', (e) => w('[PAGEERROR] ' + e.message + '\n' + (e.stack || '')));
   page.on('crash', () => finish('page crashed'));
   const url = `http://127.0.0.1:${port}/?import=server&autostart${query}`;
   w('[TEST] ' + url);
   await page.goto(url);
+  // --pause-at S: pause the page thread in the debugger after S seconds and
+  // log its JS stack (a hang on the page thread stops the log and the shots).
+  const pauseAt = +arg('pause-at', 0);
+  if (pauseAt) {
+    const cdp = await ctx.newCDPSession(page);
+    await cdp.send('Debugger.enable');
+    cdp.on('Debugger.paused', async (e) => {
+      w('[TEST] page thread paused: ' + e.reason);
+      for (const f of e.callFrames.slice(0, 15))
+        w(`[TEST]   ${f.functionName || '(anon)'} ${f.url.split('/').pop()}:${f.location.lineNumber + 1}`);
+      await cdp.send('Debugger.resume').catch(() => {});
+    });
+    setTimeout(() => cdp.send('Debugger.pause').catch((e) => w('[TEST] pause: ' + e.message)), pauseAt * 1000);
+  }
   for (const k of keys.split(',').filter(Boolean)) {
     const [t, key] = k.split(':');
     setTimeout(() => page.keyboard.press(key, { delay: 120 }).catch(() => {}), +t * 1000);

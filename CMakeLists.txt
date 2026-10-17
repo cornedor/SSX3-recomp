@@ -138,6 +138,8 @@ elseif(EMSCRIPTEN)
             ${CMAKE_CURRENT_SOURCE_DIR}/web/index.html
             ${CMAKE_CURRENT_SOURCE_DIR}/web/main.js
             ${CMAKE_CURRENT_SOURCE_DIR}/web/audio-worklet.js
+            ${CMAKE_CURRENT_SOURCE_DIR}/web/gpu.js
+            ${CMAKE_CURRENT_SOURCE_DIR}/web/xbox.wgsl
             $<TARGET_FILE_DIR:${PROJECT_NAME}>)
 else()
     target_link_libraries(${PROJECT_NAME} PRIVATE m pthread dl)
@@ -153,7 +155,15 @@ else()
     set(SSX3_VULKAN_DEFAULT ON)
 endif()
 option(SSX3_VULKAN "Build the Vulkan renderer" ${SSX3_VULKAN_DEFAULT})
-if(SSX3_VULKAN)
+if(EMSCRIPTEN)
+    # The same renderer interface (src/vk/vkr.h, driven by vkr_backend.c) on
+    # WebGPU: src/web/wgr.c records frames, web/gpu.js replays them on the
+    # page thread. RECOMP_GPU=sw keeps the software rasteriser.
+    target_sources(${PROJECT_NAME} PRIVATE src/vk/vkr_backend.c src/web/wgr.c)
+    target_include_directories(${PROJECT_NAME} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/vk ${XBOXRECOMP_DIR}/src/kernel)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE SSX3_VULKAN=1)
+elseif(SSX3_VULKAN)
     add_subdirectory(src/vk ${CMAKE_BINARY_DIR}/vk)
     target_sources(${PROJECT_NAME} PRIVATE src/vk/vkr_backend.c)
     target_include_directories(${PROJECT_NAME} PRIVATE

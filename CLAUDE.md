@@ -958,6 +958,16 @@ All env defaults are set in `src/main.c` only when unset, so a run can override 
   RECOMP_GPU_VSH=0 + RECOMP_VKR_TRACE_BRIEF=<ms after the briefing> +
   RECOMP_VKR_TRACE_EVERY (per-draw boxes with depth range), RECOMP_VKR_CLEARLOG=1,
   work\probe\trails.ps1 (race start, N short brakes, shots).
+- MOTION BLUR (2026-10-17, off by default; launcher checkbox or
+  RECOMP_MBLUR=<strength>): scene pass before the HUD (src/vk/shaders/
+  scene.frag) -- camera blur by reprojection plus radial speed streaks from
+  the heading, scaled by camera speed and distance; McGuire 2012 depth
+  weights; riders and boards (E9FDBED0, 5D983485) tagged in alpha and kept
+  sharp. Camera fitted from the terrain program each frame (scene_camera,
+  +-h steps: a unit step jittered). Knobs: RECOMP_SCENE_PARAMS (speed, s0,
+  s1, reach, edge, cap, near, mindist). Test: RECOMP_AUTONAV=race +
+  RECOMP_MBLUR_TEST=<dir> (blur/ref PPM pairs, [MBLUR-TEST] speed and
+  reprojection; _PLAN=brake=,shots=); RECOMP_MBLUR_TRACE, _PROGS. ~1 ms GPU.
 - LAUNCHER (2026-10-16): build\launcher.exe (src/launcher/launcher.c,
   plain Win32, CMake target ssx3_launcher) -- game folder picker that reads
   default.xbe's certificate (title id 4541003C = SSX 3 PAL, title name) and

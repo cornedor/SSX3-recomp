@@ -30,30 +30,41 @@ function(vkr_shader stage)
         COMMAND ${CMAKE_COMMAND} -DIN=${spv} -DOUT=${hdr} -DNAME=${name}_spv
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spv.cmake"
         DEPENDS "${src}" "${CMAKE_CURRENT_SOURCE_DIR}/embed_spv.cmake"
+                "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_common.glsl"
         VERBATIM)
     set(VKR_HEADERS ${VKR_HEADERS} "${hdr}" PARENT_SCOPE)
 endfunction()
-# vkr_shader_variant(<stage> <base> <name> <define>): the same source built
-# with -D<define> into <name>_spv.
+# vkr_shader_variant(<stage> <base> <name> <define> [<define>...]): the same
+# source built with -D<define> into <name>_spv.
 function(vkr_shader_variant stage base name def)
     set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${base}.${stage}")
     set(spv "${VKR_GEN}/${name}.spv")
     set(hdr "${VKR_GEN}/${name}_spv.h")
+    set(defs "")
+    foreach(d ${def} ${ARGN})
+        list(APPEND defs "-D${d}")
+    endforeach()
     add_custom_command(
         OUTPUT "${hdr}"
-        COMMAND ${GLSLC} --target-env=vulkan1.3 -O -D${def} -o "${spv}" "${src}"
+        COMMAND ${GLSLC} --target-env=vulkan1.3 -O ${defs} -o "${spv}" "${src}"
         COMMAND ${CMAKE_COMMAND} -DIN=${spv} -DOUT=${hdr} -DNAME=${name}_spv
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spv.cmake"
         DEPENDS "${src}" "${CMAKE_CURRENT_SOURCE_DIR}/embed_spv.cmake"
+                "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_common.glsl"
         VERBATIM)
     set(VKR_HEADERS ${VKR_HEADERS} "${hdr}" PARENT_SCOPE)
 endfunction()
 vkr_shader(vert)
 vkr_shader(frag)
 vkr_shader_variant(frag xbox xbox_frag_wdepth W_DEPTH)
+# RECOMP_MBLUR rider tags: the draw's tag in the frame's alpha, the real alpha
+# as the second blend source
+vkr_shader_variant(frag xbox xbox_frag_tags TAGS)
+vkr_shader_variant(frag xbox xbox_frag_wdepth_tags W_DEPTH TAGS)
 vkr_shader(vert xbox_vsh)
 vkr_shader(vert crt)
 vkr_shader(frag crt)
+vkr_shader(frag scene)
 
 add_library(vkr STATIC vkr.c ${VKR_HEADERS})
 # vkr_backend.c is added by the game build (needs the toolkit headers).

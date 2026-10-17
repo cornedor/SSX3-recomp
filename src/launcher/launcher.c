@@ -32,7 +32,7 @@
 
 enum {
     ID_PATH = 100, ID_BROWSE, ID_STATUS,
-    ID_RES, ID_ASPECT, ID_FULLSCREEN, ID_CRT, ID_FPS,
+    ID_RES, ID_ASPECT, ID_FULLSCREEN, ID_CRT, ID_MBLUR, ID_FPS,
     ID_SKIPINTRO, ID_DEBUGMENU,
     ID_PAD0, ID_PAD1, ID_PAD2, ID_PAD3, ID_KEYS,
     ID_LOGS, ID_PLAY,
@@ -264,6 +264,7 @@ static void load_settings(void)
     SendDlgItemMessageA(s_wnd, ID_ASPECT, CB_SETCURSEL, ini_int("aspect", 0), 0);
     CheckDlgButton(s_wnd, ID_FULLSCREEN, ini_int("fullscreen", 0));
     CheckDlgButton(s_wnd, ID_CRT, ini_int("crt", 0));
+    CheckDlgButton(s_wnd, ID_MBLUR, ini_int("motion_blur", 0));
     CheckDlgButton(s_wnd, ID_FPS, ini_int("fps_counter", 0));
     CheckDlgButton(s_wnd, ID_SKIPINTRO, ini_int("skip_intro", 1));
     CheckDlgButton(s_wnd, ID_DEBUGMENU, ini_int("debug_menu", 0));
@@ -279,6 +280,7 @@ static void save_settings(void)
     ini_set_int("aspect", (int)SendDlgItemMessageA(s_wnd, ID_ASPECT, CB_GETCURSEL, 0, 0));
     ini_set_int("fullscreen", IsDlgButtonChecked(s_wnd, ID_FULLSCREEN) == BST_CHECKED);
     ini_set_int("crt", IsDlgButtonChecked(s_wnd, ID_CRT) == BST_CHECKED);
+    ini_set_int("motion_blur", IsDlgButtonChecked(s_wnd, ID_MBLUR) == BST_CHECKED);
     ini_set_int("fps_counter", IsDlgButtonChecked(s_wnd, ID_FPS) == BST_CHECKED);
     ini_set_int("skip_intro", IsDlgButtonChecked(s_wnd, ID_SKIPINTRO) == BST_CHECKED);
     ini_set_int("debug_menu", IsDlgButtonChecked(s_wnd, ID_DEBUGMENU) == BST_CHECKED);
@@ -312,6 +314,7 @@ static void play(void)
                                                  ? k_aspect[asp].value : "auto");
     SetEnvironmentVariableA("RECOMP_FULLSCREEN", IsDlgButtonChecked(s_wnd, ID_FULLSCREEN) ? "1" : NULL);
     SetEnvironmentVariableA("RECOMP_CRT", IsDlgButtonChecked(s_wnd, ID_CRT) ? "1" : NULL);
+    SetEnvironmentVariableA("RECOMP_MBLUR", IsDlgButtonChecked(s_wnd, ID_MBLUR) ? "0.5" : NULL);
     SetEnvironmentVariableA("RECOMP_FPS_OVERLAY", IsDlgButtonChecked(s_wnd, ID_FPS) ? "1" : NULL);
     SetEnvironmentVariableA("RECOMP_SKIP_INTRO", IsDlgButtonChecked(s_wnd, ID_SKIPINTRO) ? "1" : "0");
     SetEnvironmentVariableA("RECOMP_DEBUG_MENU", IsDlgButtonChecked(s_wnd, ID_DEBUGMENU) ? "1" : NULL);
@@ -407,6 +410,8 @@ static void build(void)
     add("BUTTON", "Fullscreen (F11 toggles in game)", BS_AUTOCHECKBOX | WS_TABSTOP, ID_FULLSCREEN, 20, y, 300, 22, s_font);
     y += 24;
     add("BUTTON", "CRT TV shader (needs a resolution above 480p)", BS_AUTOCHECKBOX | WS_TABSTOP, ID_CRT, 20, y, 400, 22, s_font);
+    y += 24;
+    add("BUTTON", "Motion blur (riders stay sharp)", BS_AUTOCHECKBOX | WS_TABSTOP, ID_MBLUR, 20, y, 300, 22, s_font);
     y += 24;
     add("BUTTON", "FPS counter (F3 toggles in game)", BS_AUTOCHECKBOX | WS_TABSTOP, ID_FPS, 20, y, 300, 22, s_font);
     y += 34;

@@ -51,6 +51,7 @@ typedef struct {
     int      stencil_test;
     uint32_t stencil_func, stencil_ref, stencil_read_mask, stencil_write_mask;
     uint32_t stencil_fail, stencil_zfail, stencil_zpass;
+    int      rider;                 /* RECOMP_MBLUR tag: a rider's draw (kept sharp) */
 } VkrDrawState;
 
 #define VKR_TOPO_TRIANGLES 0
@@ -86,6 +87,20 @@ int vkr_draw_vsh(VkrContext *c, const float *in, uint32_t nverts, uint32_t nin,
                  const uint32_t *prog, uint32_t nins, uint32_t prog_hash,
                  const float (*consts)[4], const uint32_t *idx, uint32_t nidx,
                  const VkrDrawState *st);
+
+/* The scene camera for the frame being recorded (RECOMP_MBLUR): inv_m maps
+ * (guest pixel x, y, depth units - zmax, 1) to eye-relative world positions
+ * (homogeneous), prev_m eye-relative positions to last frame's (x w, y w,
+ * z w, w); column-major. Valid until the flip. */
+typedef struct {
+    float inv_m[16], prev_m[16];
+    float foe[2];       /* where the camera is heading, guest pixels */
+    float speed;        /* the camera's speed, world units per frame (0: no heading) */
+    int off;            /* no scene pass this frame (RECOMP_MBLUR_TEST reference shots) */
+} VkrScene;
+void vkr_scene_set(VkrContext *c, const VkrScene *s);
+/* Run the scene pass now (before the HUD); once per frame, after vkr_scene_set. */
+void vkr_scene_run(VkrContext *c);
 
 /* RECOMP_WIDESCREEN target: 1 = show the 4:3 picture pillarboxed (menus). */
 void vkr_set_pillarbox(VkrContext *c, int on);

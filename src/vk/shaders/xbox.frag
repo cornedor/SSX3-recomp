@@ -13,6 +13,12 @@ layout(location = 5) in vec4 v_tex2;
 layout(location = 6) in vec4 v_tex3;
 
 layout(location = 0) out vec4 out_color;
+#ifdef TAGS
+/* Rider tags (vkr.c get_pipeline): out_color.a carries the draw's tag for the
+ * scene pass's motion blur -- 1 rider, 0 the rest -- and the blend equation
+ * takes the real alpha from this second source instead. */
+layout(location = 0, index = 1) out vec4 out_src1;
+#endif
 
 layout(set = 0, binding = 0) uniform sampler2D tex[4];
 
@@ -31,6 +37,7 @@ layout(push_constant) uniform PC {
     uint alpha_ref;                       /* 0..255 */
     float w_scale;                        /* W-buffering: depth = w * this; 0 = off */
     uint point_sprite;                    /* stage 3 coordinates = gl_PointCoord (xemu psh.c) */
+    uint tag;                             /* rider tag (TAGS): 1 = a rider */
 } pc;
 
 uint U(uvec4 a[2], uint i) { return a[i >> 2][i & 3u]; }
@@ -220,6 +227,10 @@ void main()
             discard;
     }
     out_color = col;
+#ifdef TAGS
+    out_src1 = col;
+    out_color.a = float(pc.tag);
+#endif
 #ifdef W_DEPTH
     /* CONTROL0 Z_PERSPECTIVE: the depth test compares w, which is linear in
      * distance, instead of z, whose precision is spent near the camera (the

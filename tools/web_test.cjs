@@ -30,9 +30,17 @@ const keys = arg('keys', '');   // "t:Key,t:Key" -- press Key (KeyboardEvent.key
   const ctx = await chromium.launchPersistentContext(path.join(root, 'work/pw-profile'), {
     // Full Chromium in new-headless mode: unlike the headless shell it has a
     // WebGPU adapter on the real GPU (Vulkan).
+    // PW_CHROMIUM=/usr/bin/chromium-browser: a system build (aarch64 Linux,
+    // where Playwright ships none).
     headless: true, channel: 'chromium', viewport: { width: 1000, height: 900 },
+    executablePath: process.env.PW_CHROMIUM || undefined,
+    // --video: record the whole run (out/video/*.webm; [TEST] stage box logs the
+    // game area for cropping).
+    recordVideo: process.argv.includes('--video')
+      ? { dir: path.join(out, 'video'), size: { width: 1000, height: 900 } } : undefined,
     args: ['--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu',
-           '--enable-features=Vulkan', '--use-angle=vulkan'],
+           '--enable-features=Vulkan', '--use-angle=vulkan',
+           ...(process.env.PW_ARGS || '').split(' ').filter(Boolean)],
   });
   let shot = 0;
   const finish = async (why) => {
@@ -49,11 +57,36 @@ const keys = arg('keys', '');   // "t:Key,t:Key" -- press Key (KeyboardEvent.key
   // only shows what bypasses it -- useful when the page thread is stuck).
   if (process.argv.includes('--workers'))
     page.on('worker', (wk) => wk.on('console', (m) => w('[W] ' + m.text())));
+  // --worker-errors: uncaught exceptions in workers (pthreads) with their
+  // stacks, through CDP (the page only hears "worker sent an error!").
+  if (process.argv.includes('--worker-errors')) {
+    const cdp = await ctx.newCDPSession(page);
+    let id = 1;
+    const send = (sid, method, params = {}) => cdp.send('Target.sendMessageToTarget',
+      { sessionId: sid, message: JSON.stringify({ id: id++, method, params }) }).catch(() => {});
+    cdp.on('Target.attachedToTarget', (e) => {
+      send(e.sessionId, 'Runtime.enable');
+      send(e.sessionId, 'Runtime.runIfWaitingForDebugger');
+    });
+    cdp.on('Target.receivedMessageFromTarget', (e) => {
+      const m = JSON.parse(e.message);
+      if (m.method !== 'Runtime.exceptionThrown') return;
+      const d = m.params.exceptionDetails;
+      w('[WORKER-EXC] ' + (d.exception && d.exception.description || d.text));
+      for (const f of (d.stackTrace && d.stackTrace.callFrames || []).slice(0, 30))
+        w(`[WORKER-EXC]   ${f.functionName || '(anon)'} ${f.url.split('/').pop()}:${f.lineNumber + 1}:${f.columnNumber}`);
+    });
+    await cdp.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: false });
+  }
   page.on('pageerror', (e) => w('[PAGEERROR] ' + e.message + '\n' + (e.stack || '')));
   page.on('crash', () => finish('page crashed'));
   const url = `http://127.0.0.1:${port}/?import=server&autostart${query}`;
   w('[TEST] ' + url);
   await page.goto(url);
+  if (process.argv.includes('--video')) {
+    const b = await page.locator('#stage').boundingBox();
+    if (b) w(`[TEST] stage box ${Math.round(b.x)} ${Math.round(b.y)} ${Math.round(b.width)} ${Math.round(b.height)}`);
+  }
   // --pause-at S: pause the page thread in the debugger after S seconds and
   // log its JS stack (a hang on the page thread stops the log and the shots).
   const pauseAt = +arg('pause-at', 0);

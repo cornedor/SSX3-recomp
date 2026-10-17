@@ -297,9 +297,8 @@ async function start() {
   say('Starting…', { progress: null });
   overlay.dataset.keep = '';
   const env = envFromQuery();
-  // WebGPU only with ?gpu=webgpu for now: it still hangs after two frames
-  // (docs/WEB.md). The software rasteriser is the default and the fallback.
-  if (params.get('gpu') === 'webgpu' && env.RECOMP_GPU !== 'sw') {
+  // WebGPU unless ?gpu=sw; the software rasteriser is the fallback.
+  if (params.get('gpu') !== 'sw' && env.RECOMP_GPU !== 'sw') {
     try {
       gpu = await WebGPURenderer.create(canvas, log);
     } catch (e) {

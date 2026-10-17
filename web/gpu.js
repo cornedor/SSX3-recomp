@@ -88,6 +88,10 @@ class WebGPURenderer {
     this.frames = 0;
     this.skip = new URLSearchParams(location.search).get('wgskip');   // debugging: draw | vsh
     this.errors = 0;
+    // ?wgstats: once a second, [WGSTATS] frames, JS replay ms (avg/max), GPU
+    // latency submit -> readback mapped (avg/max), MB uploaded, draws.
+    this.stats = new URLSearchParams(location.search).has('wgstats')
+      ? { t: performance.now(), n: 0, js: 0, jsMax: 0, gpu: 0, gpuMax: 0, bytes: 0, draws: 0, idle: 0 } : null;
     device.addEventListener('uncapturederror', (e) => {
       if (this.errors++ < 20) log('[WEBGPU] error: ' + e.error.message);
     });
@@ -175,11 +179,23 @@ class WebGPURenderer {
       // Taken: rendering, then reading back (S_DONE once the pixels are in).
       Atomics.store(this.i32, this.slotWord(this.next, 0), S_GPU);
       if (this.frames < 4) console.log(`[WEBGPU] take slot ${this.next} #${this.frames}`);
+      const t0 = performance.now();
       try {
         this.frame(this.next);
       } catch (e) {
         this.log('[WEBGPU] frame failed: ' + (e.stack || e));
         this.done(this.next);
+      }
+      if (this.stats) {
+        const st = this.stats, dt = performance.now() - t0;
+        st.n++; st.js += dt; st.jsMax = Math.max(st.jsMax, dt);
+        st.bytes += this.u32[this.slotWord(this.next, 4)];
+        if (performance.now() - st.t >= 1000) {
+          const n = st.n, f = (v) => v.toFixed(1);
+          this.log(`[WGSTATS] ${n} frames, js ${f(st.js / n)}/${f(st.jsMax)} ms, gpu ${f(st.gpu / n)}/${f(st.gpuMax)} ms, `
+            + `${(st.bytes / n / 1048576).toFixed(2)} MB/frame, ${(st.draws / n).toFixed(0)} draws/frame`);
+          Object.assign(st, { t: performance.now(), n: 0, js: 0, jsMax: 0, gpu: 0, gpuMax: 0, bytes: 0, draws: 0 });
+        }
       }
       this.next = (this.next + 1) % this.nslots;
     }
@@ -395,6 +411,7 @@ class WebGPURenderer {
         else
           p.setBlendConstant([f32[bc], f32[bc + 1], f32[bc + 2], f32[bc + 3]]);
         p.draw(u32[a + 1]);
+        if (this.stats) this.stats.draws++;
         break;
       }
       case WGR.FLIP:
@@ -455,9 +472,13 @@ class WebGPURenderer {
     d.queue.submit([enc.finish()]);
     dbg('submitted');
     this.frames++;
-    const rb = res.rb;
+    const rb = res.rb, tSub = performance.now();
     if (this.skip === 'readback') { this.done(s); return; }
     rb.mapAsync(GPUMapMode.READ, 0, size).then(() => {
+      if (this.stats) {
+        const g = performance.now() - tSub;
+        this.stats.gpu += g; this.stats.gpuMax = Math.max(this.stats.gpuMax, g);
+      }
       if (this.frames < 4) console.log('[WEBGPU] mapped');
       const src8 = new Uint8Array(rb.getMappedRange(0, size));
       if (bpr === w * 4) this.u8.set(src8, rbPtr);

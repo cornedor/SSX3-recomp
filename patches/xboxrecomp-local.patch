@@ -3357,7 +3357,7 @@ index 0000000..2102f59
 +
 +#endif
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..a48dd59 100644
+index c65632c..9699d7d 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -25,6 +25,7 @@
@@ -5152,7 +5152,7 @@ index c65632c..a48dd59 100644
 +            info->hash = memo[slot].hash;
 +            return 1;
 +        }
-+        w = (const uint64_t *)((const uint8_t *)xbox_GetMemoryOffset() + t->offset);
++        w = (const uint64_t *)XBOX_HOST(t->offset);
 +        n = (t->cube ? 5 * tex_face_stride(t) + tex_base_bytes(t) : tex_base_bytes(t)) / 8;
 +        for (i = 0; i < n; i++)
 +            h = (h ^ w[i]) * 1099511628211ull;
@@ -5162,7 +5162,7 @@ index c65632c..a48dd59 100644
 +             * seen -- it then decodes as the unsupported-format fill). */
 +            h = (h ^ t->palette) * 1099511628211ull;
 +            if (t->palette) {
-+                w = (const uint64_t *)((const uint8_t *)xbox_GetMemoryOffset() + t->palette);
++                w = (const uint64_t *)XBOX_HOST(t->palette);
 +                for (i = 0; i < 128; i++)
 +                    h = (h ^ w[i]) * 1099511628211ull;
 +            }

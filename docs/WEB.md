@@ -2,8 +2,8 @@
 
 Branch `wasm`, based on `main` (no remaster shaders). The same lifted C and
 toolkit, compiled with Emscripten into `build-web/ssx3_recomp.{js,wasm}` plus
-a page (`web/`). Rendering is the toolkit's software rasteriser (no Vulkan in
-a browser); sound through an AudioWorklet; keyboard and Gamepad API input.
+a page (`web/`). Rendering through WebGPU (the Vulkan renderer's port, below;
+`?gpu=sw` = the toolkit's software rasteriser, also the fallback); sound through an AudioWorklet; keyboard and Gamepad API input.
 
 ## Build
 
@@ -51,10 +51,10 @@ again; `?fresh` drops the copy.
 | XInput / SDL pads, window keys | Gamepad API polled by the page (`web_pad`), keys by `KeyboardEvent.code` (`web_key`); same key map as `play.bat`. |
 | Thread dumps, watchpoints, crash handler | Not available (no signals, no single-step). |
 
-## WebGPU renderer (in progress, 2026-10-17)
+## WebGPU renderer (2026-10-17, the default)
 
-Software rendering on the web: race 4-8 FPS (headless Chromium, this box).
-The port of the Vulkan renderer to WebGPU is written but **not working yet**:
+Race on Snow Jam ~49 FPS in headless Chromium on lavapipe (CPU Vulkan, this
+aarch64 box); the software rasteriser does 4-8.
 
 - `src/web/wgr.c` implements `src/vk/vkr.h` (so `vkr_backend.c` is reused):
   it records each frame -- commands plus all data -- into one of two slots in
@@ -65,22 +65,28 @@ The port of the Vulkan renderer to WebGPU is written but **not working yet**:
   slot's buffer and marks it DONE. `web/xbox.wgsl` is the GLSL shaders ported
   (no vertex buffers: vertices/indices pulled from storage; points and lines
   expanded to quads; y flipped; border addressing in the shader).
-- Page: WebGPU only with `?gpu=webgpu` until the hang is fixed; sets `RECOMP_WEBGPU=1` for the C side.
+- Page: WebGPU unless `?gpu=sw` or no adapter; sets `RECOMP_WEBGPU=1` for the C side.
 
-**Open bug:** after the first two frames the page thread blocks inside native
-code (no timers, no CDP pause possible) and the C side then waits for slot 0
-forever. It happens with every draw skipped (`?wgskip=draw`), without the
-canvas present (`wgskip=present`) and without readback (`wgskip=readback`),
-and not when the renderer is not attached (`wgskip=attach`). Passing typed-array
-views instead of the whole 2 GB SharedArrayBuffer to writeBuffer/writeTexture
-did not help. Next: find what the page thread blocks on (e.g. Chrome tracing,
-or a stripped-down page that only replays two recorded slots), suspects being
-Atomics.waitAsync/notify interplay with the emscripten futex words, or a
-blocking Dawn call.
+The "hang after two frames" was the GPU executor trapping (memory access out
+of bounds) in `nv2a_exec_tex_info`: its texture hash read guest memory as
+`xbox_GetMemoryOffset() + offset`, the native 1:1 layout, and SSX 3's
+textures are in the contiguous window. Now `XBOX_HOST`. Only the GPU backend
+calls it, so the software path never hit it. Any other `xbox_GetMemoryOffset()
++ va` left in the toolkit is the same bug waiting (`nv2a_pb_exec.c` still has
+a dozen `mem + ...` uses; the software path's work, so far fine).
 
 Testing: `node tools/web_test.cjs --secs N --every S [--query "&env=..."]`
 (Playwright, full Chromium new-headless: it has a WebGPU adapter on the real
 GPU, the headless shell has none; `--pause-at S` dumps the page thread's JS
-stack; `--workers` adds workers' console). Setup:
-`(cd work/pw && npm install playwright@1.48.2 && npx playwright install chromium)`.
+stack; `--workers` adds workers' console; `--worker-errors` logs uncaught
+worker exceptions with their wasm stacks -- start there when frames stop;
+`--video` records the run to `work/web-run/video/`). `?wgstats` logs
+[WGSTATS] once a second: JS replay ms, GPU latency (submit -> readback), MB
+uploaded and draws per frame. Headless Chromium on this box only offers
+llvmpipe (no Honeykrisp adapter, whatever the flags): race at 1440x1080
+~45 FPS, GPU latency 20-35 ms; at `?env=RECOMP_RES=1` a steady 60 (GPU 11 ms,
+JS 1 ms) -- fill-bound on the CPU rasteriser, not the renderer.
+Setup: `(cd work/pw && npm install playwright@1.48.2 && npx playwright install chromium)`;
+on aarch64 Linux (no Playwright Chromium) `npm install playwright` and run with
+`PW_CHROMIUM=/usr/bin/chromium-browser`.
 `?hb` logs a page heartbeat each second; `?wgskip=draw|vsh|present|readback|attach`.

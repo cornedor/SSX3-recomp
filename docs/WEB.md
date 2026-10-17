@@ -65,7 +65,7 @@ The port of the Vulkan renderer to WebGPU is written but **not working yet**:
   slot's buffer and marks it DONE. `web/xbox.wgsl` is the GLSL shaders ported
   (no vertex buffers: vertices/indices pulled from storage; points and lines
   expanded to quads; y flipped; border addressing in the shader).
-- Page: WebGPU unless `?gpu=sw`; sets `RECOMP_WEBGPU=1` for the C side.
+- Page: WebGPU only with `?gpu=webgpu` until the hang is fixed; sets `RECOMP_WEBGPU=1` for the C side.
 
 **Open bug:** after the first two frames the page thread blocks inside native
 code (no timers, no CDP pause possible) and the C side then waits for slot 0

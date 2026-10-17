@@ -40,11 +40,12 @@ enum { S_FREE, S_RECORDING, S_SUBMITTED, S_DONE, S_GPU /* gpu.js has it */ };
 enum {
     WGR_TARGET = 1,     /* w h sw sh                         new colour + depth target */
     WGR_SCISSOR,        /* x y w h (target pixels) */
-    WGR_CLEAR,          /* param_off flags(1 colour, 2 depth) */
+    WGR_CLEAR,          /* param_off flags(1 colour, 2 depth, 4 stencil) stencil */
     WGR_TEX_CREATE,     /* id w h data_off bytes_per_row */
     WGR_TEX_UPDATE,     /* id data_off bytes_per_row */
     WGR_TEX_FREE,       /* id */
-    WGR_DRAW,           /* param_off nverts key0 key1 tex[4] samp[4] blend_color[4] */
+    WGR_DRAW,           /* param_off nverts key0 key1 tex[4] samp[4] blend_color[4]
+                           stencil(test func fail zfail zpass) masks(read | write << 8) ref */
     WGR_FLIP,           /* rb_ptr w h bars gamma_ptr gamma_serial */
 };
 
@@ -340,7 +341,8 @@ void vkr_set_scissor(VkrContext *c, uint32_t x, uint32_t y, uint32_t w, uint32_t
     apply_scissor(c);
 }
 
-static void clear(VkrContext *c, const float rgba[4], uint32_t flags, float depth)
+static void clear(VkrContext *c, const float rgba[4], uint32_t flags, float depth,
+                  uint32_t stencil)
 {
     WgrDraw *d;
     uint8_t *ptr;
@@ -355,20 +357,22 @@ static void clear(VkrContext *c, const float rgba[4], uint32_t flags, float dept
     if (rgba)
         memcpy(d->u.fog_color, rgba, 16);
     d->u.fog_param[0] = depth;
-    p = emit(c, WGR_CLEAR, 2);
+    p = emit(c, WGR_CLEAR, 3);
     if (!p)
         return;
-    p[0] = off; p[1] = flags;
+    p[0] = off; p[1] = flags; p[2] = stencil & 0xFF;
 }
 
 void vkr_clear(VkrContext *c, const float rgba[4], int clear_depth, float depth)
 {
-    clear(c, rgba, 1u | (clear_depth ? 2u : 0u), depth);
+    clear(c, rgba, 1u | (clear_depth ? 2u : 0u), depth, 0);
 }
 
-void vkr_clear_depth(VkrContext *c, float depth)
+void vkr_clear_ds(VkrContext *c, int clear_depth, float depth, int clear_stencil, uint32_t stencil)
 {
-    clear(c, NULL, 2u, depth);
+    uint32_t flags = (clear_depth ? 2u : 0u) | (clear_stencil ? 4u : 0u);
+    if (flags)
+        clear(c, NULL, flags, depth, stencil);
 }
 
 /* ---- textures --------------------------------------------------------- */
@@ -540,6 +544,21 @@ static uint32_t samp_key(const VkrDrawState *st, int k)
     return (st->addr_u[k] & 7) | (st->addr_v[k] & 7) << 3 | (uint32_t)(st->linear[k] != 0) << 6;
 }
 
+/* NV2A stencil op (GL enum) -> gpu.js STENCIL_OP index. */
+static uint32_t stencil_op(uint32_t gl)
+{
+    switch (gl) {
+    case 0x0000: return 1;              /* zero */
+    case 0x1E01: return 2;              /* replace */
+    case 0x1E02: return 3;              /* increment-clamp */
+    case 0x1E03: return 4;              /* decrement-clamp */
+    case 0x150A: return 5;              /* invert */
+    case 0x8507: return 6;              /* increment-wrap */
+    case 0x8508: return 7;              /* decrement-wrap */
+    default:     return 0;              /* keep */
+    }
+}
+
 static int emit_draw(VkrContext *c, uint32_t param_off, uint32_t nidx, const VkrDrawState *st)
 {
     uint32_t *p, nverts, k;
@@ -549,7 +568,7 @@ static int emit_draw(VkrContext *c, uint32_t param_off, uint32_t nidx, const Vkr
            : st->topology == VKR_TOPO_LINES ? (nidx / 2) * 6 : nidx;
     if (!nverts)
         return 1;
-    p = emit(c, WGR_DRAW, 16);
+    p = emit(c, WGR_DRAW, 19);
     if (!p)
         return 0;
     p[0] = param_off; p[1] = nverts;
@@ -566,6 +585,16 @@ static int emit_draw(VkrContext *c, uint32_t param_off, uint32_t nidx, const Vkr
         p[8 + k] = samp_key(st, (int)k);
     }
     memcpy(&p[12], st->blend_color, 16);
+    /* stencil: bit 0 test, 1-3 func, 4-6 fail, 7-9 zfail, 10-12 zpass */
+    if (st->stencil_test) {
+        p[16] = 1u | (st->stencil_func >= 0x200 && st->stencil_func <= 0x207 ? st->stencil_func - 0x200 : 7) << 1
+              | stencil_op(st->stencil_fail) << 4 | stencil_op(st->stencil_zfail) << 7
+              | stencil_op(st->stencil_zpass) << 10;
+        p[17] = (st->stencil_read_mask & 0xFF) | (st->stencil_write_mask & 0xFF) << 8;
+        p[18] = st->stencil_ref & 0xFF;
+    } else {
+        p[16] = p[17] = p[18] = 0;
+    }
     return 1;
 }
 
@@ -682,10 +711,10 @@ int vkr_flip_submit(VkrContext *c)
         memcpy(save, c->sc, sizeof save);
         c->sc[0] = 0; c->sc[1] = 0; c->sc[2] = bars; c->sc[3] = c->sh;
         c->sc_valid = 0;
-        clear(c, black, 1u, 0.0f);
+        clear(c, black, 1u, 0.0f, 0);
         c->sc[0] = c->sw - bars;
         c->sc_valid = 0;
-        clear(c, black, 1u, 0.0f);
+        clear(c, black, 1u, 0.0f, 0);
         memcpy(c->sc, save, sizeof save);
         c->sc_valid = 0;
     }

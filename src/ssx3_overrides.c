@@ -353,7 +353,7 @@ void sub_000CC8F0(void)
         last = want;
     }
     if (!keep)
-        MEM8(app + 0x38) = 0;
+        ST8(app + 0x38, 0);
 }
 
 /*

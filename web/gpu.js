@@ -24,6 +24,8 @@ const GL_BLEND = {
 };
 const GL_EQ = { 0x8006: 'add', 0x800A: 'subtract', 0x800B: 'reverse-subtract', 0x8007: 'min', 0x8008: 'max' };
 const DEPTH_FN = ['never', 'less', 'equal', 'less-equal', 'greater', 'not-equal', 'greater-equal', 'always'];
+const STENCIL_OP = ['keep', 'zero', 'replace', 'increment-clamp', 'decrement-clamp', 'invert',
+  'increment-wrap', 'decrement-wrap'];          // wgr.c stencil_op()
 
 const PRESENT_WGSL = `
 @group(0) @binding(0) var img: texture_2d<f32>;
@@ -54,10 +56,15 @@ class WebGPURenderer {
     if (!navigator.gpu) return null;
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) return null;
+    // The NV2A's Z24S8 has a stencil buffer SSX 3 uses (the snow trails fix up
+    // depth through it): depth32float-stencil8 where available.
+    const d32s8 = adapter.features.has('depth32float-stencil8');
     const device = await adapter.requestDevice({
+      requiredFeatures: d32s8 ? ['depth32float-stencil8'] : [],
       requiredLimits: { maxStorageBufferBindingSize: Math.min(DATA_BYTES, adapter.limits.maxStorageBufferBindingSize) },
     });
     const r = new WebGPURenderer(device, canvas, log);
+    r.depthFmt = d32s8 ? 'depth32float-stencil8' : 'depth24plus-stencil8';
     const info = adapter.info || {};
     log(`[WEBGPU] ${info.vendor || '?'} ${info.architecture || ''} ${info.description || ''}`.trim());
     try {
@@ -248,8 +255,8 @@ class WebGPURenderer {
     return bg;
   }
 
-  pipeline(k0, k1) {
-    const key = k0 * 4294967296 + k1;
+  pipeline(k0, k1, sk, sm) {
+    const key = `${k0},${k1},${sk},${sm}`;
     let p = this.pipes.get(key);
     if (p) return p;
     const blendOn = k0 & 1, mask = (k0 >> 1) & 15, dtest = (k0 >> 5) & 1, dwrite = (k0 >> 6) & 1;
@@ -268,13 +275,23 @@ class WebGPURenderer {
       vertex: { module: this.mod, entryPoint: 'vs_main' },
       fragment: { module: this.mod, entryPoint: wdepth ? 'fs_main_wdepth' : 'fs_main', targets: [target] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: 'depth32float',
-        depthWriteEnabled: !!(dtest && dwrite), depthCompare: dtest ? DEPTH_FN[dfunc] : 'always' },
+      depthStencil: { format: this.depthFmt,
+        depthWriteEnabled: !!(dtest && dwrite), depthCompare: dtest ? DEPTH_FN[dfunc] : 'always',
+        ...this.stencilState(sk, sm) },
     });
     if (this.pipes.size < 400 && this.pipes.size % 10 === 0)
       this.log(`[WEBGPU] pipeline ${this.pipes.size}: ${(performance.now() - t0).toFixed(1)} ms`);
     this.pipes.set(key, p);
     return p;
+  }
+
+  // wgr.c's stencil word: bit 0 test, 1-3 func, 4-6 fail, 7-9 zfail, 10-12
+  // zpass; masks read | write << 8. Test off: never touched.
+  stencilState(sk, sm) {
+    if (!(sk & 1)) return { stencilReadMask: 0, stencilWriteMask: 0 };
+    const f = { compare: DEPTH_FN[(sk >> 1) & 7], failOp: STENCIL_OP[(sk >> 4) & 7],
+      depthFailOp: STENCIL_OP[(sk >> 7) & 7], passOp: STENCIL_OP[(sk >> 10) & 7] };
+    return { stencilFront: f, stencilBack: f, stencilReadMask: sm & 0xFF, stencilWriteMask: (sm >> 8) & 0xFF };
   }
 
   clearPipe(flags) {
@@ -287,7 +304,9 @@ class WebGPURenderer {
         fragment: { module: this.mod, entryPoint: 'fs_clear',
           targets: [{ format: 'bgra8unorm', writeMask: flags & 1 ? GPUColorWrite.ALL : 0 }] },
         primitive: { topology: 'triangle-list' },
-        depthStencil: { format: 'depth32float', depthWriteEnabled: !!(flags & 2), depthCompare: 'always' },
+        depthStencil: { format: this.depthFmt, depthWriteEnabled: !!(flags & 2), depthCompare: 'always',
+          ...(flags & 4 ? { stencilFront: { passOp: 'replace' }, stencilBack: { passOp: 'replace' },
+                            stencilWriteMask: 0xFF } : { stencilWriteMask: 0 }) },
       });
       this.pipes.set(key, p);
     }
@@ -299,7 +318,7 @@ class WebGPURenderer {
     const t = { w, h, sw, sh, valid: false };
     t.color = d.createTexture({ size: [sw, sh], format: 'bgra8unorm',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING });
-    t.depth = d.createTexture({ size: [sw, sh], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    t.depth = d.createTexture({ size: [sw, sh], format: this.depthFmt, usage: GPUTextureUsage.RENDER_ATTACHMENT });
     t.colorView = t.color.createView();
     t.depthView = t.depth.createView();
     if (sw !== w || sh !== h) {
@@ -339,7 +358,8 @@ class WebGPURenderer {
         colorAttachments: [{ view: tg.colorView, loadOp: tg.valid ? 'load' : 'clear',
           clearValue: [0, 0, 0, 0], storeOp: 'store' }],
         depthStencilAttachment: { view: tg.depthView, depthLoadOp: tg.valid ? 'load' : 'clear',
-          depthClearValue: 1.0, depthStoreOp: 'store' },
+          depthClearValue: 1.0, depthStoreOp: 'store',
+          stencilLoadOp: tg.valid ? 'load' : 'clear', stencilClearValue: 0, stencilStoreOp: 'store' },
       });
       tg.valid = true;
       pass.setViewport(0, 0, tg.sw, tg.sh, 0, 1);
@@ -368,6 +388,7 @@ class WebGPURenderer {
         if (!t()) break;
         const p = beginPass();
         p.setPipeline(this.clearPipe(u32[a + 1]));
+        p.setStencilReference(u32[a + 2]);
         p.setBindGroup(0, res.bg0, [u32[a]]);
         p.setBindGroup(1, this.bindTextures([0, 0, 0, 0], [0, 0, 0, 0]));
         p.draw(3);
@@ -400,7 +421,8 @@ class WebGPURenderer {
         if (!t() || this.skip === 'draw' || (this.skip === 'vsh' && this.f32[(dataPtr + u32[a]) / 4 + 94] !== 0)) break;
         const p = beginPass();
         const k0 = u32[a + 2], k1 = u32[a + 3];
-        p.setPipeline(this.pipeline(k0, k1));
+        p.setPipeline(this.pipeline(k0, k1, u32[a + 16], u32[a + 17]));
+        p.setStencilReference(u32[a + 18]);
         p.setBindGroup(0, res.bg0, [u32[a]]);
         p.setBindGroup(1, this.bindTextures(
           [u32[a + 4], u32[a + 5], u32[a + 6], u32[a + 7]], [u32[a + 8], u32[a + 9], u32[a + 10], u32[a + 11]]));

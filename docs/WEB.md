@@ -66,6 +66,9 @@ aarch64 box); the software rasteriser does 4-8.
   (no vertex buffers: vertices/indices pulled from storage; points and lines
   expanded to quads; y flipped; border addressing in the shader).
 - Page: WebGPU unless `?gpu=sw` or no adapter; sets `RECOMP_WEBGPU=1` for the C side.
+- Stencil (the snow trails use it, see the Vulkan renderer): depth32float-stencil8
+  where the adapter has it, else depth24plus-stencil8; stencil state is part
+  of the pipeline key, the reference is set per draw.
 
 The "hang after two frames" was the GPU executor trapping (memory access out
 of bounds) in `nv2a_exec_tex_info`: its texture hash read guest memory as

@@ -234,14 +234,17 @@ void sub_0009C7A0(void)
 }
 
 /* In-game update (sub_000CC8F0, this = ingame state): the first-person
- * shooter mode (src/fps_mode.c) moves the camera and fires after it. */
+ * shooter mode (src/fps_mode.c) moves the camera and fires after it, then
+ * the gearbox (src/gears_mode.c) drives the board. */
 extern void sub_000CC8F0_gen(void);
 extern void ssx3_FpsTick(void);
+extern void ssx3_GearsTick(void);
 
 void sub_000CC8F0(void)
 {
     sub_000CC8F0_gen();
     ssx3_FpsTick();
+    ssx3_GearsTick();
 }
 
 /* In-game screen opener sub_000C4C20(type), cdecl: RECOMP_STATION_TRACE=1

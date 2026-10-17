@@ -178,10 +178,19 @@ static int s_rel_mode;
 static int key_pressed(int vk)
 {
     const uint8_t *k;
-    if (vk != 0x73 || !SDL_GetKeyboardState)    /* only F4 is asked for */
+    int sc;
+    if (vk >= 'A' && vk <= 'Z')
+        sc = 4 + (vk - 'A');                    /* SDL_SCANCODE_A.. */
+    else if (vk >= 0x70 && vk <= 0x7B)
+        sc = 58 + (vk - 0x70);                  /* VK_F1.. -> SDL_SCANCODE_F1.. */
+    else if (vk == 0x20)
+        sc = 44;                                /* SDL_SCANCODE_SPACE */
+    else
+        return 0;
+    if (!SDL_GetKeyboardState)
         return 0;
     k = SDL_GetKeyboardState(NULL);
-    return k && k[61];                          /* SDL_SCANCODE_F4 */
+    return k && k[sc];
 }
 
 static void mouse_poll(int active, int *dx, int *dy, int *fire)
@@ -357,6 +366,45 @@ static void write_camera(uint32_t cam, const float eye[3], const float f[3])
     wrf(cam + 0x9C, 0.0f);
 }
 
+/* ---------------------------------------- shared with gears_mode.c */
+
+extern int ssx3_GearsWantMouse(void);
+static int ingame_state(uint32_t *state);
+static int s_gear_dx, s_gear_dy;
+
+int ssx3_HostKey(int vk) { return key_pressed(vk); }
+
+/* Mouse movement taken for the gear knob since the last call. */
+void ssx3_GearsMouse(int *dx, int *dy)
+{
+    *dx = s_gear_dx;
+    *dy = s_gear_dy;
+    s_gear_dx = s_gear_dy = 0;
+}
+
+/* Player 1's rider base while in the in-game state (0 if none); *mode its
+ * physics mode (names at 0x00283274). */
+uint32_t ssx3_PlayerRider(int *mode)
+{
+    uint32_t state, m, me;
+    if (!ingame_state(&state) || !(m = rider_manager()) || !(me = rider(m, 0)))
+        return 0;
+    *mode = rider_mode(me);
+    return me;
+}
+
+void ssx3_RiderWipeout(uint32_t b, const float dir[3]) { rider_wipeout(b, dir); }
+
+/* Rider i (0 = player 1, up to 5) while in the in-game state, with its mode. */
+uint32_t ssx3_RiderN(int i, int *mode)
+{
+    uint32_t state, m, b;
+    if (!ingame_state(&state) || !(m = rider_manager()) || !(b = rider(m, i)))
+        return 0;
+    *mode = rider_mode(b);
+    return b;
+}
+
 /* ------------------------------------------------------------ per update */
 
 static void fps_init(void)
@@ -390,7 +438,7 @@ void ssx3_FpsTick(void)
     static int f4_was;
     uint32_t state, m, me, cam, now = xbox_TickCountMs();
     float pos[3], vel[3], eye[3], f[3], speed, cp;
-    int dx, dy, fire, f4, i;
+    int dx, dy, fire, f4, i, gear_grab;
 
     if (!s_inited)
         fps_init();
@@ -425,7 +473,15 @@ void ssx3_FpsTick(void)
         s_last_mode = -1;
     }
     s_active = cam != 0;
-    mouse_poll(s_active, &dx, &dy, &fire);
+    /* The gearbox (gears_mode.c) borrows the mouse while its shifter key
+     * is held: the movement goes to the gear knob, not the view. */
+    gear_grab = ssx3_GearsWantMouse();
+    mouse_poll(s_active || gear_grab, &dx, &dy, &fire);
+    if (gear_grab) {
+        s_gear_dx += dx;
+        s_gear_dy += dy;
+        dx = dy = 0;
+    }
     if (!s_active) {
         s_was_active = 0;
         return;

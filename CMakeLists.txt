@@ -57,6 +57,7 @@ set(GAME_SOURCES
     src/game_state.c
     src/autonav.c
     src/fps_mode.c
+    src/gears_mode.c
     src/mmio_posix.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c

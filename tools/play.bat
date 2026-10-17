@@ -11,6 +11,8 @@ rem     arrows     d-pad          numpad 8/4/2/6   left stick
 rem     I J K L    right stick    Shift / Ctrl     stick clicks
 rem     F3         FPS counter      F11 / Alt+Enter  fullscreen
 rem     F4         first-person shooter mode (mouse aims, left button fires)
+rem     F5         18-speed gearbox: hold G + mouse = stick, Space = clutch,
+rem                R = range, F = splitter
 rem   An Xbox/XInput controller works too and needs no setting.
 rem
 rem Logs go to play_stdout.txt / play_stderr.txt (console output slows it);

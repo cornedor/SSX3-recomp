@@ -980,6 +980,22 @@ All env defaults are set in `src/main.c` only when unset, so a run can override 
   [+0x74C] mode +0xE60 (names at 0x283274: 0 Ground 1 Air 2 Wipeout 3
   Static ... 12 Gate); camera [[ingame+0x84]+4] (vtable 0x28630C, eye +0x30,
   view matrix +0x50). Header comment of fps_mode.c has the details.
+- GEARBOX MODE (2026-10-18, for fun): RECOMP_GEARS=1 / F5 -- src/gears_mode.c,
+  an 18-speed Eaton Fuller box (R/LL, 1/2, 3/4 gate; range 5-8; splitter).
+  Hold G + mouse moves the stick (fps_mode.c hands it the mouse delta),
+  Space clutch, R range, F splitter. Gear top speeds 300..3600; drives /
+  governs the rider velocity +0x250 after the in-game update; a grind,
+  over-rev, stall or lug calls the game's wipeout (ssx3_RiderWipeout).
+  Below 0.45 of a gear's top the engine drags (too-high gear is slow).
+  On the ground only 20% of the slope's own speed-up is kept
+  (RECOMP_GEARS_GRAVITY) and rolling + air drag is added (RECOMP_GEARS_DRAG):
+  coasting tops out ~900, the engine pushes. Velocity lives at rider +0x250
+  and copies at phys +0xC30 / +0xC70 (RECOMP_GEARS_PROBE=1 found them; all
+  three are scaled together; found/left ~1.0 suggests writes stick).
+  Other riders: same box, automatic driver, 4% of shifts grind
+  (RECOMP_GEARS_AI=0 / _AI_MISS). [GEARS] logs shifts, failures and the
+  player's ground speed p50/p90/max every 15 s -- calibrate gear tops with
+  RECOMP_GEARS_TOP=<LL-L>,<8H> (default 400,3600).
 - Untranslated instructions reached (no-ops): `wbinvd`, `out`/`in`, `ldmxcsr`.
 - Upstream candidates: the toolkit fixes in `patches/`; `tools.split`
   ignoring applied names (docs/DECOMP.md says otherwise); template

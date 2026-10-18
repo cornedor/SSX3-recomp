@@ -981,9 +981,9 @@ All env defaults are set in `src/main.c` only when unset, so a run can override 
   Static ... 12 Gate); camera [[ingame+0x84]+4] (vtable 0x28630C, eye +0x30,
   view matrix +0x50). Header comment of fps_mode.c has the details.
 - GEARBOX MODE (2026-10-18, for fun): RECOMP_GEARS=1 / F5 -- src/gears_mode.c,
-  an 18-speed Eaton Fuller box (R/LL, 1/2, 3/4 gate; range 5-8; splitter).
-  Hold G + mouse moves the stick (fps_mode.c hands it the mouse delta),
-  Space clutch, R range, F splitter. Gear top speeds 300..3600; drives /
+  an 18-speed Eaton Fuller box (LL, 1-4 low, 5-8 high, each split),
+  shifted sequentially: R up, F down, N neutral, Space clutch; the HUD
+  shows the gate, range and splitter. Gear top speeds 400..4800 (8H ~1.5x the game's ~3150); drives /
   governs the rider velocity +0x250 after the in-game update; a grind,
   over-rev, stall or lug calls the game's wipeout (ssx3_RiderWipeout).
   Below 0.45 of a gear's top the engine drags (too-high gear is slow).
@@ -992,10 +992,14 @@ All env defaults are set in `src/main.c` only when unset, so a run can override 
   coasting tops out ~900, the engine pushes. Velocity lives at rider +0x250
   and copies at phys +0xC30 / +0xC70 (RECOMP_GEARS_PROBE=1 found them; all
   three are scaled together; found/left ~1.0 suggests writes stick).
+  Units are cm/s (the game's constants are km/h / 3.6 * 100). The game
+  caps speed at rider +0x350 (~2222 = 80 km/h): sub_0002CD90 scales the
+  velocity down to it, sub_000365C0 eases it toward its target (up 10%,
+  down 3% per frame); the gearbox holds it at 8H top x 1.05 for all riders.
   Other riders: same box, automatic driver, 4% of shifts grind
   (RECOMP_GEARS_AI=0 / _AI_MISS). [GEARS] logs shifts, failures and the
   player's ground speed p50/p90/max every 15 s -- calibrate gear tops with
-  RECOMP_GEARS_TOP=<LL-L>,<8H> (default 400,3600).
+  RECOMP_GEARS_TOP=<LL-L>,<8H> (default 400,4800).
 - Untranslated instructions reached (no-ops): `wbinvd`, `out`/`in`, `ldmxcsr`.
 - Upstream candidates: the toolkit fixes in `patches/`; `tools.split`
   ignoring applied names (docs/DECOMP.md says otherwise); template

@@ -2,26 +2,23 @@
  * Stick-shift snowboarding (RECOMP_GEARS=1; F5 toggles it in a race). Just
  * for fun: the board has an 18-speed Eaton Fuller truck gearbox.
  *
- * The box, as on the real thing:
- *   - H pattern of three columns: R / LL, 1 / 2, 3 / 4. With the range
- *     selector up (high) the 1-4 positions are 5-8. LL works in either range.
- *   - Splitter: every position has a low and a high split. 2 LL + 8 low +
- *     8 high = 18 forward gears.
- *   - Range and splitter are preselected: the range engages when the stick
- *     passes through neutral, the splitter when the clutch is down (or in
- *     neutral).
- * Controls: hold G and move the mouse to move the stick (it follows the
- * gate: across only on the neutral rail, in and out only in a column),
- * Space = clutch, R = range selector, F = splitter.
+ * The gears, in Eaton Fuller order: LL-L LL-H 1L 1H 2L .. 8H (2 LL + 8
+ * low range + 8 high range, each split low / high). The HUD shows them on
+ * the real gate (LL, 1 / 2, 3 / 4; 5-8 in high range) with range and
+ * splitter.
+ * Controls: sequential -- R one gear up, F one gear down; from neutral
+ * either picks the gear that fits the speed; N = neutral; Space = clutch.
  *
  * The engine: each gear has a top speed (redline), from 400 in LL-L to
- * 3600 in 8H (geometric); rpm = board speed / that. In gear with the clutch
- * up it
+ * 4800 in 8H (geometric; the game alone tops out ~3150); rpm = board
+ * speed / that. In gear with the clutch up it
  *   - pulls between 0.45 and redline (0.3 at the bottom, peak at 0.85),
  *   - drags the board back below 0.45 (bogging: a too-high gear is slow),
  *   - holds the board at redline (engine braking: steep slope, shift up),
  *   - stalls below 0.15, and lugs to a stall below 0.30 for 1.5 s.
  *   LL to 1H can slip the clutch from rest.
+ * The game's own speed cap (rider +0x350, ~80 km/h) is held above 8H's
+ * top for every rider while the box is on.
  * The board resists: only 20% of the speed the game's physics adds on the
  * ground is kept (RECOMP_GEARS_GRAVITY) and rolling + air drag is taken off
  * (RECOMP_GEARS_DRAG), so coasting tops out around 900 and the engine does
@@ -29,15 +26,15 @@
  * The other riders get the same box with an automatic driver: each shift
  * is 0.35-0.75 s of coasting in neutral, and 4% of them grind (wipeout).
  * A missed shift -- into gear without the clutch and with the rpm off by
- * more than 0.25 (the revs hang in neutral, so a quick shift floats in), a downshift that would spin past 1.25 x redline, reverse
- * at speed, or a stall -- grinds the box and throws the rider over the
- * nose (the game's own wipeout, via fps_mode.c).
+ * more than 0.25 (one step floats in; the revs hang in neutral), a
+ * downshift that would spin past 1.25 x redline, or a stall -- grinds the
+ * box and throws the rider over the nose (the game's own wipeout, via
+ * fps_mode.c).
  *
  * Writes the rider's velocity (+0x250) after the game's update.
  *   RECOMP_GEARS=1           start with it on (F5 toggles)
  *   RECOMP_GEARS_POWER=<f>   engine pull (default 1)
- *   RECOMP_GEARS_SENS=<f>    stick speed (default 1)
- *   RECOMP_GEARS_TOP=<8H>    or <LL-L>,<8H>: gear top speeds (400,3600)
+ *   RECOMP_GEARS_TOP=<8H>    or <LL-L>,<8H>: gear top speeds (400,4800)
  *   RECOMP_GEARS_GRAVITY=<f> share of the slope's own speed-up kept (0.2)
  *   RECOMP_GEARS_DRAG=<f>    board drag factor (1)
  *   RECOMP_GEARS_PROBE=1     where the velocity lives (see probe_scan)
@@ -59,41 +56,37 @@
 #include <string.h>
 
 #define NGEARS      18
-#define GEAR_R      18
-#define IN_GEAR_Y   0.8f
 #define FLOAT_TOL   0.25f      /* rpm mismatch a clutchless shift gets away with */
-#define VK_G        'G'
-#define VK_R        'R'
-#define VK_F        'F'
+#define VK_N        'N'
+#define KEY_SHIFT_UP   'R'
+#define KEY_SHIFT_DOWN 'F'
 #define VK_SPACE_   0x20
 #define VK_F5_      0x74
 
 extern uint32_t xbox_TickCountMs(void);
 extern int ssx3_HostKey(int vk);
-extern void ssx3_GearsMouse(int *dx, int *dy);
 extern uint32_t ssx3_PlayerRider(int *mode);
 extern void ssx3_RiderWipeout(uint32_t b, const float dir[3]);
 extern uint32_t ssx3_RiderN(int i, int *mode);
 
 static int s_inited, s_enabled;
-static float s_power = 1.0f, s_sens = 1.0f;
-static float s_top0 = 400.0f, s_top8 = 3600.0f;     /* LL-L / 8H top speeds */
+static float s_power = 1.0f;
+static float s_top0 = 400.0f, s_top8 = 4800.0f;     /* 8H: ~1.5x the game's top speed */     /* LL-L / 8H top speeds */
 static float s_ai_miss = 0.04f;                     /* AI: share of shifts that grind */
 static float s_gravity = 0.2f;                      /* share of the game's own speed-up kept */
 static float s_drag = 1.0f;                         /* board drag factor */
 static float s_prev_speed;                          /* player: speed we left the board at */
 static int s_ai_on = 1;
 static uint32_t s_live, s_last_tick, s_lug_ms, s_dead_until;
-static int s_range_hi, s_split_hi;          /* preselected */
-static int s_eng_range, s_eng_split;        /* engaged */
-static int s_r_was, s_f_was, s_f5_was;
+static int s_sel = -1;                      /* gear the stick is in (-1 neutral) */
+static int s_up_was, s_down_was, s_n_was, s_f5_was;
 
 /* Read by the flip thread. */
 static volatile int s_hud;                  /* in a race with the mode on */
 static volatile float s_kx, s_ky;           /* stick in gate units */
-static volatile int s_gear = -1;            /* engaged: -1 neutral, 0..17, GEAR_R */
+static volatile int s_gear = -1;            /* engaged: -1 neutral, 0..17 */
 static volatile float s_rpm, s_grade;
-static volatile int s_clutch, s_hud_range, s_hud_split, s_hud_eng_range;
+static volatile int s_clutch, s_range, s_split; /* HUD: range / splitter of s_sel */
 static volatile uint32_t s_fail_t;
 static const char *volatile s_fail_msg, *volatile s_fail_hint;
 
@@ -110,63 +103,43 @@ static void gear_name(int g, char *buf, size_t n)
 {
     if (g < 0)
         snprintf(buf, n, "N");
-    else if (g == GEAR_R)
-        snprintf(buf, n, "R");
     else if (g < 2)
         snprintf(buf, n, "LL%c", g ? 'H' : 'L');
     else
         snprintf(buf, n, "%d%c", (g - 2) / 2 + 1, (g - 2) & 1 ? 'H' : 'L');
 }
 
-/* The gear the stick, range and splitter select (-1 = neutral). */
-static int knob_gear(void)
+/* Show gear g (-1 = neutral) on the HUD's gate: stick slot, range and
+ * splitter, as the real box would have them. */
+static void set_knob(int g)
 {
-    int col, top, pos;
-    if (fabsf(s_ky) < IN_GEAR_Y)
-        return -1;
-    col = (int)lroundf(s_kx);
-    top = s_ky < 0;
-    if (col < 0)
-        return top ? GEAR_R : s_eng_split;
-    pos = (col == 0 ? 1 : 3) + (top ? 0 : 1) + (s_eng_range ? 4 : 0);
-    return 2 + (pos - 1) * 2 + s_eng_split;
-}
-
-/* Move the stick through the gate: across only on the neutral rail, in and
- * out only in a column. Mouse right/down = stick right/down. */
-static void move_knob(float mx, float my)
-{
-    float kx = s_kx, ky = s_ky, col = clampf(roundf(kx), -1, 1);
-    if (fabsf(ky) > 0.1f) {
-        kx = col;
-        ky = clampf(ky + my, -1, 1);
-        if (fabsf(ky) <= 0.1f) {            /* back on the rail: may go across */
-            ky = 0;
-            kx = clampf(kx + mx, -1, 1);
-        }
-    } else {
-        kx = clampf(kx + mx, -1, 1);
-        col = clampf(roundf(kx), -1, 1);
-        if (fabsf(kx - col) < 0.15f && fabsf(my) > 0.0f) {
-            kx = col;
-            ky = clampf(my, -1, 1);
-        } else {
-            ky = 0;
-        }
+    int pos;
+    s_sel = g;
+    if (g < 0) {
+        s_ky = 0;
+        return;
     }
-    s_kx = kx;
-    s_ky = ky;
+    if (g < 2) {                            /* LL: bottom left */
+        s_kx = -1; s_ky = 1;
+        s_range = 0; s_split = g;
+        return;
+    }
+    pos = (g - 2) / 2 + 1;                  /* 1..8 */
+    s_split = (g - 2) & 1;
+    s_range = pos > 4;
+    if (pos > 4) pos -= 4;
+    s_kx = pos <= 2 ? 0.0f : 1.0f;
+    s_ky = pos & 1 ? -1.0f : 1.0f;
 }
 
 static void reset_box(void)
 {
     s_kx = s_ky = 0;
-    s_gear = -1;
+    s_sel = s_gear = -1;
     s_rpm = 0.12f;
     s_lug_ms = 0;
     s_prev_speed = 0;
-    s_range_hi = s_eng_range = 0;
-    s_split_hi = s_eng_split = 0;
+    s_range = s_split = 0;
 }
 
 /* A missed shift: grind, stall, over the nose. */
@@ -183,18 +156,12 @@ static void fail(uint32_t me, const char *why, const char *hint, const float vel
     s_fail_msg = why;
     s_fail_hint = hint;
     s_fail_t = now;
-    s_kx = s_ky = 0;
+    set_knob(-1);
     s_gear = -1;
     s_rpm = 0;
     s_lug_ms = 0;
     s_prev_speed = 0;
     s_dead_until = now + 1500;
-}
-
-/* Whether the gearbox takes the mouse this update (fps_mode.c asks). */
-int ssx3_GearsWantMouse(void)
-{
-    return s_hud && ssx3_HostKey(VK_G);
 }
 
 #define BOG_RPM     0.45f      /* below: the engine drags the board back */
@@ -231,7 +198,7 @@ static float power_curve(float r)
  * band (power / speed, at most ACCEL_MAX), bogs (drags) below it, holds
  * the board at redline. LL to 1H slip the clutch from rest. Returns the
  * rpm (fraction of redline). */
-#define ENGINE_P    8.0e6f
+#define ENGINE_P    1.5e7f
 #define ACCEL_MAX   1200.0f
 
 static float engine(uint32_t b, float vel[3], float speed, int g, float dt)
@@ -263,8 +230,8 @@ static float engine(uint32_t b, float vel[3], float speed, int g, float dt)
  * 2000+, and the engine has to push the board. Slowing down (carving,
  * braking, uphill) is the game's own. prev = the speed we left it at,
  * 0 = none (first update on the ground). Returns the new speed. */
-#define DRAG_ROLL   50.0f
-#define DRAG_AIR    3.1e-4f
+#define DRAG_ROLL   200.0f
+#define DRAG_AIR    1.2e-4f
 
 static float board_drag(uint32_t b, float vel[3], float speed, float prev, float dt)
 {
@@ -277,6 +244,17 @@ static float board_drag(uint32_t b, float vel[3], float speed, float prev, float
     if (speed > 1.0f && want != speed)
         scale_vel(b, vel, want / speed);
     return want;
+}
+
+/* The game's speed cap, rider +0x350 (cm/s): sub_0002CD90 scales the
+ * velocity down to it, sub_000365C0 eases it toward the rider's target
+ * each frame (~2222 = 80 km/h; up by 10%, down by 3% of the gap). Held
+ * above 8H's top while the gearbox is on, so the gears set the speed. */
+static void lift_cap(uint32_t b)
+{
+    float cap = s_top8 * 1.05f;
+    if (!(rdf(b + 0x350) >= cap))
+        wrf(b + 0x350, cap);
 }
 
 static float vlen(const float v[3]) { return sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
@@ -316,6 +294,7 @@ static void ai_tick(int i, uint32_t now, float dt)
         a->b = 0;
         return;
     }
+    lift_cap(b);
     if (a->b != b) {
         memset(a, 0, sizeof *a);
         a->b = b;
@@ -453,13 +432,33 @@ static void speed_note(float speed, uint32_t now)
     s_speed_t = now;
 }
 
+/* R / F: one gear up / down (range and splitter follow). From neutral
+ * either picks the gear that fits the speed; N = neutral. */
+static void shift_keys(float speed)
+{
+    int up = ssx3_HostKey(KEY_SHIFT_UP), down = ssx3_HostKey(KEY_SHIFT_DOWN), n = ssx3_HostKey(VK_N);
+    if (n && !s_n_was)
+        set_knob(-1);
+    else if ((up && !s_up_was) || (down && !s_down_was)) {
+        if (s_sel < 0)
+            set_knob(ai_pick(speed));
+        else if (up && !s_up_was && s_sel < NGEARS - 1)
+            set_knob(s_sel + 1);
+        else if (down && !s_down_was && s_sel > 0)
+            set_knob(s_sel - 1);
+    }
+    s_up_was = up;
+    s_down_was = down;
+    s_n_was = n;
+}
+
 /* Called on the game thread after every in-game update (sub_000CC8F0),
  * after the FPS mode's tick (which polls the mouse). */
 void ssx3_GearsTick(void)
 {
     uint32_t me, now = xbox_TickCountMs();
     float vel[3], speed, speed_h, dt, road;
-    int mode, f5, r, f, clutch, g, air, wipe, dx, dy;
+    int mode, f5, clutch, g, air, wipe;
     const char *e;
 
     if (!s_inited) {
@@ -467,7 +466,6 @@ void ssx3_GearsTick(void)
         e = getenv("RECOMP_GEARS");
         s_enabled = e && *e && *e != '0';
         if ((e = getenv("RECOMP_GEARS_POWER")) && atof(e) >= 0) s_power = (float)atof(e);
-        if ((e = getenv("RECOMP_GEARS_SENS")) && atof(e) > 0) s_sens = (float)atof(e);
         if ((e = getenv("RECOMP_GEARS_TOP")) && atof(e) > 0) {
             const char *c = strchr(e, ',');
             if (c) {                        /* <LL-L>,<8H> */
@@ -513,6 +511,7 @@ void ssx3_GearsTick(void)
         return;
     }
     s_hud = 1;
+    lift_cap(me);
     if (s_ai_on) {
         int i;
         for (i = 1; i < 6; i++)
@@ -520,15 +519,6 @@ void ssx3_GearsTick(void)
     }
 
     clutch = ssx3_HostKey(VK_SPACE_);
-    r = ssx3_HostKey(VK_R);
-    f = ssx3_HostKey(VK_F);
-    if (r && !s_r_was) s_range_hi = !s_range_hi;
-    if (f && !s_f_was) s_split_hi = !s_split_hi;
-    s_r_was = r;
-    s_f_was = f;
-    ssx3_GearsMouse(&dx, &dy);
-    if (dx || dy)
-        move_knob((float)dx / 120.0f * s_sens, (float)dy / 120.0f * s_sens);
 
     vel[0] = rdf(me + 0x250); vel[1] = rdf(me + 0x254); vel[2] = rdf(me + 0x258);
     if (!isfinite(vel[0]) || !isfinite(vel[1]) || !isfinite(vel[2]))
@@ -548,22 +538,15 @@ void ssx3_GearsTick(void)
     if (!air && !wipe)
         speed_note(speed, now);
 
-    /* preselected range / splitter engage */
-    if (fabsf(s_ky) < IN_GEAR_Y)
-        s_eng_range = s_range_hi;
-    if (clutch || fabsf(s_ky) < IN_GEAR_Y)
-        s_eng_split = s_split_hi;
     s_clutch = clutch;
-    s_hud_range = s_range_hi;
-    s_hud_split = s_split_hi;
-    s_hud_eng_range = s_eng_range;
+    shift_keys(speed);
 
     if (wipe) {                             /* down: nothing to drive */
         s_lug_ms = 0;
         return;
     }
 
-    g = knob_gear();
+    g = s_sel;
     road = g >= 0 && g < NGEARS ? speed / gear_top(g) : 0.0f;
     if (g != s_gear) {
         char a[8], b[8];
@@ -571,9 +554,6 @@ void ssx3_GearsTick(void)
         gear_name(g, b, sizeof b);
         if (g >= 0 && now < s_dead_until) {
             /* engine still dead after a failure: nothing to grind */
-        } else if (g == GEAR_R && speed > 150.0f) {
-            fail(me, "REVERSE AT SPEED", "STOP BEFORE REVERSE", vel, now);
-            return;
         } else if (g >= 0 && g < NGEARS && road > 1.25f) {
             fail(me, "OVER-REV", "TOO LOW A GEAR FOR THIS SPEED", vel, now);
             return;
@@ -719,7 +699,7 @@ void ssx3_GearsOverlay(uint32_t *px, int w, int h, int stride)
     float u, rpm = s_rpm;
     char buf[16];
     static const char *const labels[2][6] = {
-        {"R", "LL", "1", "2", "3", "4"}, {"R", "LL", "5", "6", "7", "8"}};
+        {"", "LL", "1", "2", "3", "4"}, {"", "LL", "5", "6", "7", "8"}};
 
     if (!s_hud || !px || w < 160 || h < 120)
         return;
@@ -744,9 +724,9 @@ void ssx3_GearsOverlay(uint32_t *px, int w, int h, int stride)
     for (c = -1; c <= 1; c++) {
         fill_rect(gx + c * cw - 1, gy - rh, gx + c * cw + 2, gy + rh, 0x707070u);
         for (i = 0; i < 2; i++) {
-            const char *l = labels[s_hud_eng_range][(c + 1) * 2 + i];
-            text(l, gx + c * cw - text_w(l, gs) / 2, i ? gy + rh + 2 * gs : gy - rh - 9 * gs,
-                 gs, 0xD0D0D0u);
+            const char *l = labels[s_range][(c + 1) * 2 + i];
+            int ly = i ? gy + rh + 2 * gs : gy - rh - 9 * gs;
+            text(l, gx + c * cw - text_w(l, gs) / 2, ly, gs, 0xD0D0D0u);
         }
     }
     disc((float)gx + s_kx * (float)cw, (float)gy + s_ky * (float)rh, 5.0f * u,
@@ -757,22 +737,22 @@ void ssx3_GearsOverlay(uint32_t *px, int w, int h, int stride)
         int tx = gx + cw + (int)(22 * u), ty = y0 + (int)(12 * u);
         if (s_gear >= 0) {
             int g = s_gear;
-            if (g == 18) snprintf(buf, sizeof buf, "R");
-            else if (g < 2) snprintf(buf, sizeof buf, "LL%c", g ? 'H' : 'L');
+            if (g < 2) snprintf(buf, sizeof buf, "LL%c", g ? 'H' : 'L');
             else snprintf(buf, sizeof buf, "%d%c", (g - 2) / 2 + 1, (g - 2) & 1 ? 'H' : 'L');
         } else {
             snprintf(buf, sizeof buf, "N");
         }
         text(buf, tx, ty, big, 0xFFFFFFu);
         ty += 9 * big;
-        text(s_hud_range ? "HI" : "LO", tx, ty, gs + 1,
-             s_hud_range == s_hud_eng_range ? 0x60D0FFu : 0x406080u);
-        text(s_hud_split ? "SPLIT H" : "SPLIT L", tx + 4 * 6 * (gs + 1), ty, gs, 0xD0D0D0u);
+        text(s_range ? "HI" : "LO", tx, ty, gs + 1, 0x60D0FFu);
+        text(s_split ? "SPLIT H" : "SPLIT L", tx + 4 * 6 * (gs + 1), ty, gs, 0xD0D0D0u);
         ty += 10 * (gs + 1);
         text("CLUTCH", tx, ty, gs, s_clutch ? 0x60FF60u : 0x404040u);
         ty += 10 * gs;
         snprintf(buf, sizeof buf, "GRADE %d%%", (int)lroundf(s_grade));
         text(buf, tx, ty, gs, 0xD0D0D0u);
+        ty += 10 * gs;
+        text("R UP F DOWN", tx, ty, gs, 0x707070u);
     }
 
     /* tach: green band, redline */

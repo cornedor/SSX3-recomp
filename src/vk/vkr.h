@@ -51,7 +51,7 @@ typedef struct {
     int      stencil_test;
     uint32_t stencil_func, stencil_ref, stencil_read_mask, stencil_write_mask;
     uint32_t stencil_fail, stencil_zfail, stencil_zpass;
-    int      rider;                 /* RECOMP_MBLUR tag: a rider's draw (kept sharp) */
+    int      rider;                 /* RECOMP_MBLUR tag: 255 player 1 (sharp), 1..7 another rider's slot, 0 none */
 } VkrDrawState;
 
 #define VKR_TOPO_TRIANGLES 0
@@ -97,6 +97,7 @@ typedef struct {
     float foe[2];       /* where the camera is heading, guest pixels */
     float speed;        /* the camera's speed, world units per frame (0: no heading) */
     int off;            /* no scene pass this frame (RECOMP_MBLUR_TEST reference shots) */
+    float rider_v[8][2];  /* rider slot k's motion on screen, guest pixels (tag k; 0 unused) */
 } VkrScene;
 void vkr_scene_set(VkrContext *c, const VkrScene *s);
 /* Run the scene pass now (before the HUD); once per frame, after vkr_scene_set. */

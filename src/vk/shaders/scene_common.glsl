@@ -19,6 +19,7 @@ layout(set = 0, binding = 4, std140) uniform S {
     vec4 dims2;         /* zmax, target w, h, time */
     vec4 mb2;           /* motion blur: edge boost, longest blur (pixels at 1080 lines) */
     vec4 mb3;           /* speed blur: focus of expansion (guest pixels), strength now, reach */
+    vec4 rider_v[4];    /* rider slot k's motion on screen (guest pixels): .xy even k, .zw odd */
 } sc;
 
 ivec2 tsize() { return ivec2(sc.dims2.yz); }
@@ -38,10 +39,25 @@ vec3 pos_at(vec2 p, float d)
 
 bool is_sky(float d) { return d >= 1.0; }
 
-/* Rider tags (xbox.frag TAGS) in the frame's alpha: 1 a rider, 0 the rest.
- * Without tags (no dualSrcBlend) the alpha is the game's: no pixel is a
- * rider then, and only the near distance keeps the rider sharp. */
-bool tag_rider(float t) { return sc.mb.w > 0.5 && t >= 0.5; }
+/* Rider tags (xbox.frag TAGS) in the frame's alpha, times 255: 255 player 1
+ * (kept sharp), 1..7 another rider's slot (blurred by its own motion), 0 the
+ * rest. Without tags (no dualSrcBlend) the alpha is the game's: no pixel is
+ * a rider then, and only the near distance keeps the rider sharp. */
+int tag_of(float t) { return sc.mb.w > 0.5 ? int(t * 255.0 + 0.5) : 0; }
+bool tag_player(float t) { return tag_of(t) == 255; }
+
+/* the motion on screen of the rider a pixel's tag names, guest pixels;
+ * false for player 1 and untagged pixels */
+bool rider_motion(float t, out vec2 v)
+{
+    int k = tag_of(t);
+    v = vec2(0.0);
+    if (k < 1 || k > 7)
+        return false;
+    vec4 q = sc.rider_v[k >> 1];
+    v = (k & 1) != 0 ? q.zw : q.xy;
+    return true;
+}
 
 /* Interleaved gradient noise (Jimenez, SIGGRAPH 2014): per pixel, fixed
  * over time -- a pattern that changes every frame reads as shimmer. */

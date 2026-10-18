@@ -824,41 +824,53 @@ static void scene_camera(const float *in, const Nv2aVshProgram *p)
     s_cam_inv_ok = inv4(s_cam.m, s_cam_inv);
 }
 
-/* Of the rider draws, only player 1's stays sharp: the draw's first vertex,
- * taken back to the world through the last fitted camera, lies within 3 m
- * of player 1's position (ssx3_PlayerPos, game_state.c). The other riders
- * are blurred with the scene. RECOMP_MBLUR_RIDERS=1 keeps every rider
- * sharp. */
-extern int ssx3_PlayerPos(float out[3]);
+/* Which rider a rider draw is: its first vertex, taken back to the world
+ * through the last fitted camera, lies within 3 m of that rider's position
+ * (ssx3_RiderPos, game_state.c). The draw's tag (xbox.frag, scene.frag):
+ * 255 player 1 (kept sharp), 1..7 another rider's slot (blurred by its own
+ * motion on screen, scene_flip), 0 none found (blurred with the scene).
+ * RECOMP_MBLUR_RIDERS=1 keeps every rider sharp. */
+#define MB_RIDERS 8
+extern int ssx3_RiderPos(int i, float out[3]);
 
-static int player_draw(const float *in, const Nv2aVshProgram *p)
+static uint32_t rider_tag(const float *in, const Nv2aVshProgram *p)
 {
     static int all = -1;
-    float vin[NV2A_VSH_INPUTS][4], pp[3];
-    double v[4], wp[4], d2 = 0.0;
+    float vin[NV2A_VSH_INPUTS][4], rp[3];
+    double v[4], wp[4], best = 300.0 * 300.0;
     Nv2aVshOutput o;
-    int a, r;
+    uint32_t tag = 0;
+    int a, r, i;
     if (all < 0) {
         const char *e = getenv("RECOMP_MBLUR_RIDERS");
         all = e && *e && *e != '0';
     }
-    if (all || !s_cam_inv_ok || !ssx3_PlayerPos(pp))
-        return 1;
+    if (all || !s_cam_inv_ok)
+        return 255;
     memset(vin, 0, sizeof vin);
     for (a = 0; a < NV2A_VSH_INPUTS; a++)
         if (p->in_slot[a] != 0xFF)
             memcpy(vin[a], in + p->in_slot[a] * 4, sizeof vin[a]);
     if (!nv2a_vsh_run((const float (*)[4])vin, &o) || !(o.pos[3] > 0.0f))
-        return 1;
+        return 255;
     v[0] = (double)o.pos[0] * o.pos[3]; v[1] = (double)o.pos[1] * o.pos[3];
     v[2] = (double)o.pos[2] * o.pos[3]; v[3] = o.pos[3];
     for (r = 0; r < 4; r++)
         wp[r] = s_cam_inv[r][0] * v[0] + s_cam_inv[r][1] * v[1] + s_cam_inv[r][2] * v[2] + s_cam_inv[r][3] * v[3];
     if (fabs(wp[3]) < 1e-9)
-        return 1;
-    for (r = 0; r < 3; r++)
-        d2 += (wp[r] / wp[3] - pp[r]) * (wp[r] / wp[3] - pp[r]);
-    return d2 < 300.0 * 300.0;
+        return 255;
+    for (i = 0; i < MB_RIDERS; i++) {
+        double d2 = 0.0;
+        if (!ssx3_RiderPos(i, rp))
+            continue;
+        for (r = 0; r < 3; r++)
+            d2 += (wp[r] / wp[3] - rp[r]) * (wp[r] / wp[3] - rp[r]);
+        if (d2 < best) {
+            best = d2;
+            tag = i == 0 ? 255u : (uint32_t)i;
+        }
+    }
+    return tag;
 }
 
 /* 4x4 inverse (Gauss-Jordan, partial pivoting); 0 if singular. */
@@ -910,6 +922,12 @@ static int cam_project(double m[4][4], const double p[3], double *gx, double *gy
         return 0;
     *gx = c[0] / c[3]; *gy = c[1] / c[3];
     return 1;
+}
+
+/* clip w of a world point through camera m (its distance in front, ~) */
+static double rider_w(double m[4][4], const double p[3])
+{
+    return m[3][0] * p[0] + m[3][1] * p[1] + m[3][2] * p[2] + m[3][3];
 }
 
 static void scene_flip(void)
@@ -999,6 +1017,51 @@ static void scene_flip(void)
             s_rider_sharp = s_rider_blur = 0;
             last = now_ms();
             wpx = 0.0;
+        }
+    }
+    {
+        /* each other rider's motion on screen (guest pixels): this frame's
+         * position through this frame's camera minus last frame's through
+         * last frame's -- next to the player it is ~0, passing it is not */
+        static double prev_pos[MB_RIDERS][3];
+        static int prev_ok[MB_RIDERS];
+        int i;
+        for (i = 1; i < MB_RIDERS; i++) {
+            float rp[3];
+            double pos[3], ax, ay, bx, by;
+            int ok = ssx3_RiderPos(i, rp);
+            for (k = 0; k < 3; k++) pos[k] = rp[k];
+            /* not across a respawn (a jump of over 5 m), nor for a rider at
+             * the eye plane (its projection runs off to infinity) */
+            if (ok && have_prev && prev_ok[i]
+                    && (pos[0] - prev_pos[i][0]) * (pos[0] - prev_pos[i][0])
+                     + (pos[1] - prev_pos[i][1]) * (pos[1] - prev_pos[i][1])
+                     + (pos[2] - prev_pos[i][2]) * (pos[2] - prev_pos[i][2]) < 500.0 * 500.0
+                    && rider_w(s_cam.m, pos) > 100.0 && rider_w(prev, prev_pos[i]) > 100.0
+                    && cam_project(s_cam.m, pos, &ax, &ay)
+                    && cam_project(prev, prev_pos[i], &bx, &by)) {
+                sc.rider_v[i][0] = (float)(ax - bx);
+                sc.rider_v[i][1] = (float)(ay - by);
+            }
+            memcpy(prev_pos[i], pos, sizeof pos);
+            prev_ok[i] = ok;
+        }
+        {
+            /* RECOMP_MBLUR_TRACE=1: once a second, each rider's motion */
+            static int tr = -1;
+            static double last;
+            if (tr < 0) tr = getenv("RECOMP_MBLUR_TRACE") != NULL;
+            if (tr && now_ms() - last > 1000.0) {
+                char buf[256];
+                int n = 0;
+                for (i = 1; i < MB_RIDERS; i++)
+                    if (prev_ok[i])
+                        n += snprintf(buf + n, sizeof buf - n, " %d:%.1f", i,
+                                      hypot(sc.rider_v[i][0], sc.rider_v[i][1]));
+                buf[n] = 0;
+                fprintf(stderr, "[MBLUR-RIDERS] px/frame%s\n", n ? buf : " none");
+                last = now_ms();
+            }
         }
     }
     sc.off = s_mb_off_next;
@@ -1198,8 +1261,8 @@ static int be_draw_vsh(const Nv2aTarget *t, uint32_t prim, const float *in, uint
         }
         st.rider = 0;
         if (rider_program(p->hash)) {
-            st.rider = player_draw(in, p);
-            if (st.rider) s_rider_sharp++; else s_rider_blur++;
+            st.rider = (int)rider_tag(in, p);
+            if (st.rider == 255) s_rider_sharp++; else s_rider_blur++;
         }
         s_draw_no++;
         if (s_cam.valid && !s_scene_ran && n) {

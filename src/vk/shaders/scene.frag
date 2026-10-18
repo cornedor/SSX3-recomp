@@ -19,8 +19,10 @@
  * Filter for Plausible Motion Blur" (I3D 2012): each sample is weighed by
  * which of the two is in front (a soft depth compare) and whether the
  * nearer one's blur reaches the other, so near geometry does not smear
- * into what lies behind it and vice versa. Riders (tags) and HUD models
- * stay sharp and are never sampled. */
+ * into what lies behind it and vice versa. Player 1 (tag) and HUD models
+ * stay sharp and are never sampled; the other riders blur by their own
+ * motion on screen (vkr_backend.c scene_flip), so one riding alongside
+ * stays sharp and one passing streaks. */
 
 #include "scene_common.glsl"
 
@@ -31,22 +33,27 @@ const int TAPS = 16;
 float scl;                      /* pixel sizes are for 1080 lines */
 
 /* the blur at target pixel p with depth d, in target pixels; zero where
- * nothing blurs (riders, HUD models, nearer than the near distance) */
+ * nothing blurs (player 1, HUD models, nearer than the near distance) */
 vec2 blur_at(vec2 p, float d, float tag, out float dist)
 {
     bool sky = is_sky(d);
     vec3 P = pos_at(p, sky ? 1.0 : d);
+    vec2 v;
     dist = sky ? 1e9 : length(P);
-    if (tag_rider(tag) || (!sky && (dist < sc.mb.z || dist < sc.mb.y)))
+    if (tag_player(tag) || (!sky && (dist < sc.mb.z || dist < sc.mb.y)))
         return vec2(0.0);
-    vec2 v = vec2(0.0);
-    vec4 pc = sc.prev_m * vec4(P, 1.0);
-    if (pc.w > 1e-3)
-        v = (p - pc.xy / pc.w / sc.dims.zw) * sc.mb.x;
-    /* near snow streaks, the far backdrop much less (it barely moves) */
-    v += (p - sc.mb3.xy / sc.dims.zw) * sc.mb3.z * clamp(sc.mb3.w / dist, 0.15, 1.0);
-    vec2 e = p / sc.dims2.yz * 2.0 - 1.0;
-    v *= 1.0 + sc.mb2.x * dot(e, e) * 0.5;
+    if (rider_motion(tag, v)) {
+        v = v / sc.dims.zw * sc.mb.x;
+    } else {
+        v = vec2(0.0);
+        vec4 pc = sc.prev_m * vec4(P, 1.0);
+        if (pc.w > 1e-3)
+            v = (p - pc.xy / pc.w / sc.dims.zw) * sc.mb.x;
+        /* near snow streaks, the far backdrop much less (it barely moves) */
+        v += (p - sc.mb3.xy / sc.dims.zw) * sc.mb3.z * clamp(sc.mb3.w / dist, 0.15, 1.0);
+        vec2 e = p / sc.dims2.yz * 2.0 - 1.0;
+        v *= 1.0 + sc.mb2.x * dot(e, e) * 0.5;
+    }
     float len = length(v), mx = sc.mb2.y * scl;
     return len > mx ? v * (mx / len) : v;
 }
@@ -79,7 +86,7 @@ void main()
             continue;                                   /* the centre itself */
         vec2 q = clamp(p + v * t, vec2(0.5), sc.dims2.yz - 0.5);
         vec4 sq = texelFetch(img, ivec2(q), 0);
-        if (tag_rider(sq.a))
+        if (tag_player(sq.a))
             continue;
         float zs;
         float ls = length(blur_at(q, depth_at(ivec2(q)), sq.a, zs));

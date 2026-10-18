@@ -1000,10 +1000,16 @@ All env defaults are set in `src/main.c` only when unset, so a run can override 
   RECOMP_MBLUR=<strength>): scene pass before the HUD (src/vk/shaders/
   scene.frag) -- camera blur by reprojection plus radial speed streaks from
   the heading, scaled by camera speed and distance; McGuire 2012 depth
-  weights; player 1's rider and board (E9FDBED0, 5D983485 draws whose first
-  vertex, unprojected through the fitted camera, lies within 3 m of
-  ssx3_PlayerPos) tagged in alpha and kept sharp; the other riders blur
-  with the scene (RECOMP_MBLUR_RIDERS=1: all riders sharp, the old way). Camera fitted from the terrain program each frame (scene_camera,
+  weights; rider and board draws (E9FDBED0, 5D983485) are matched to a rider
+  slot by their first vertex, unprojected through the fitted camera, within
+  3 m of ssx3_RiderPos (rider manager slots: 0 player 1, vtable 0x00282B08;
+  1-5 computer riders, 0x00282520) and tagged in alpha (tag / 255: 255
+  player 1, kept sharp; 1..7 another rider). Other riders blur by their own
+  motion on screen (scene_flip: position through this frame's camera minus
+  last frame's through last frame's; none across a >5 m jump or near the eye
+  plane), so one riding alongside stays sharp and one passing streaks
+  ([MBLUR-RIDERS] with RECOMP_MBLUR_TRACE; RECOMP_MBLUR_RIDERS=1: all
+  riders sharp). Camera fitted from the terrain program each frame (scene_camera,
   +-h steps: a unit step jittered). Knobs: RECOMP_SCENE_PARAMS (speed, s0,
   s1, reach, edge, cap, near, mindist). Test: RECOMP_AUTONAV=race +
   RECOMP_MBLUR_TEST=<dir> (blur/ref PPM pairs, [MBLUR-TEST] speed and

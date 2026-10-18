@@ -1818,7 +1818,7 @@ int vkr_draw(VkrContext *c, const VkrVertex *v, uint32_t nverts,
         memcpy(&pcf[2], &ws, 4);
     }
     pcf[3] = st->topology == VKR_TOPO_POINTS && st->point_sprite;
-    pcf[4] = (uint32_t)(st->rider != 0);
+    pcf[4] = (uint32_t)st->rider;
     vkCmdPushConstants(c->cmd, c->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 64, 20, pcf);
 
     for (k = 0; k < 4; k++) {
@@ -1935,7 +1935,7 @@ int vkr_draw_vsh(VkrContext *c, const float *in, uint32_t nverts, uint32_t nin,
         memcpy(&pcf[2], &ws, 4);
     }
     pcf[3] = st->topology == VKR_TOPO_POINTS && st->point_sprite;
-    pcf[4] = (uint32_t)(st->rider != 0);
+    pcf[4] = (uint32_t)st->rider;
     vkCmdPushConstants(c->cmd, c->layout, VK_SHADER_STAGE_FRAGMENT_BIT, 64, 20, pcf);
 
     for (k = 0; k < 4; k++) {
@@ -2104,7 +2104,7 @@ static void scene_pass(VkrContext *c)
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
     VkViewport vp = {0, 0, (float)c->sw, (float)c->sh, 0.0f, 1.0f};
     VkRect2D sc = {{0, 0}, {c->sw, c->sh}};
-    float u[52];
+    float u[68];
     uint32_t off = (c->buf_used + 255) & ~255u, k;
     if (off + sizeof u > VKR_BUF_BYTES)
         return;
@@ -2122,6 +2122,10 @@ static void scene_pass(VkrContext *c)
         u[48] = c->cam.foe[0]; u[49] = c->cam.foe[1];
         u[50] = c->cam.speed > 0.0f ? c->sc_p[5] * t * t * (3.0f - 2.0f * t) : 0.0f;
         u[51] = c->sc_p[8];
+    }
+    for (k = 0; k < 8; k++) {           /* the riders' own motion (tags 1..7) */
+        u[52 + 2 * k] = c->cam.rider_v[k][0];
+        u[53 + 2 * k] = c->cam.rider_v[k][1];
     }
     memcpy(c->buf_map + off, u, sizeof u);
     c->buf_used = off + (uint32_t)sizeof u;

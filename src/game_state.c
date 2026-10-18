@@ -32,6 +32,7 @@
 #include <math.h>
 
 #define APP_PTR_VA 0x003A930Cu
+#define SSX3_RIDERS 8               /* rider slots looked at (a race has 6) */
 
 static const struct { uint32_t vt; const char *name; } k_states[] = {
     /* Learned by watching a run through every screen (tools\to_race.ps1
@@ -179,18 +180,27 @@ void ssx3_GameStateStart(void)
     CloseHandle(CreateThread(NULL, 0, game_state_thread, NULL, 0, NULL));
 }
 
-/* Player 1's rider position (world, Z-up), for the motion blur (vkr_backend.c
- * keeps only this rider sharp). The rider manager [[[0x369534]+0x74]+0xC]
- * (vtable 0x0028216C) holds the riders at +0x28 + 4*i, slot 0 = player 1;
- * a rider's position is at +0x180. 0 outside a race. */
-int ssx3_PlayerPos(float out[3])
+/* Rider i's position (world, Z-up), for the motion blur (vkr_backend.c keeps
+ * player 1 sharp and blurs the others by their own motion). The rider manager
+ * [[[0x369534]+0x74]+0xC] (vtable 0x0028216C) holds the riders at
+ * +0x28 + 4*i, slot 0 = player 1 (vtable 0x00282B08 in a race), then the
+ * computer riders (0x00282520); a rider's position is at +0x180. A slot
+ * counts when its object has one of those two vtables. 0 outside a race. */
+int ssx3_RiderPos(int i, float out[3])
 {
-    uint32_t g = MEM32(0x00369534u), a, m, b;
-    if (!guest_ok(g) || !guest_ok(a = MEM32(g + 0x74)) || !guest_ok(m = MEM32(a + 0xC))
-            || MEM32(m) != 0x0028216Cu || !guest_ok(b = MEM32(m + 0x28)))
+    uint32_t g = MEM32(0x00369534u), a, m, b, b0;
+    if (i < 0 || i >= SSX3_RIDERS || !guest_ok(g) || !guest_ok(a = MEM32(g + 0x74))
+            || !guest_ok(m = MEM32(a + 0xC)) || MEM32(m) != 0x0028216Cu
+            || !guest_ok(b0 = MEM32(m + 0x28)) || !guest_ok(b = MEM32(m + 0x28 + 4u * (uint32_t)i))
+            || (MEM32(b) != MEM32(b0) && MEM32(b) != 0x00282520u))
         return 0;
     out[0] = MEMF(b + 0x180);
     out[1] = MEMF(b + 0x184);
     out[2] = MEMF(b + 0x188);
     return isfinite(out[0]) && isfinite(out[1]) && isfinite(out[2]);
+}
+
+int ssx3_PlayerPos(float out[3])
+{
+    return ssx3_RiderPos(0, out);
 }

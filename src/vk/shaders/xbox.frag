@@ -18,7 +18,8 @@ layout(location = 6) in vec4 v_tex3;
 layout(location = 0) out vec4 out_color;
 #ifdef TAGS
 /* Rider tags (vkr.c get_pipeline): out_color.a carries the draw's tag for the
- * scene pass's motion blur -- 1 rider, 0 the rest -- and the blend equation
+ * scene pass's motion blur -- tag / 255: 255 player 1, 1..7 another rider,
+ * 0 the rest -- and the blend equation
  * takes the real alpha from this second source instead. */
 layout(location = 0, index = 1) out vec4 out_src1;
 #endif
@@ -40,7 +41,7 @@ layout(push_constant) uniform PC {
     uint alpha_ref;                       /* 0..255 */
     float w_scale;                        /* W-buffering: depth = w * this; 0 = off */
     uint point_sprite;                    /* stage 3 coordinates = gl_PointCoord (xemu psh.c) */
-    uint tag;                             /* rider tag (TAGS): 1 = a rider */
+    uint tag;                             /* rider tag (TAGS): 255 player 1, 1..7 another rider */
 } pc;
 
 /* The specialized words: 0-7 colour ICW, 8-15 alpha ICW, 16-23 colour OCW,
@@ -343,7 +344,7 @@ void main()
     out_color = col;
 #ifdef TAGS
     out_src1 = col;
-    out_color.a = float(pc.tag);
+    out_color.a = float(pc.tag) / 255.0;
 #endif
 #ifdef W_DEPTH
     /* CONTROL0 Z_PERSPECTIVE: the depth test compares w, which is linear in

@@ -180,8 +180,19 @@ int ssx3_WidescreenNow(void)
     return ssx3_InGame();
 }
 
+extern float ssx3_CamFovScale(void);
+
 void sub_0024EA13(void)
 {
+    float fk = ssx3_CamFovScale();
+    if (fk != 1.0f && ssx3_InGame()) {   /* the race camera's speed FOV (camera_mode.c) */
+        uint32_t bits = MEM32(g_esp + 8);
+        float fovy;
+        memcpy(&fovy, &bits, 4);
+        fovy = 2.0f * atanf(tanf(fovy * 0.5f) * fk);
+        memcpy(&bits, &fovy, 4);
+        MEM32(g_esp + 8) = bits;
+    }
     if (ssx3_WidescreenNow()) {
         uint32_t bits = MEM32(g_esp + 12);
         float aspect;
@@ -327,6 +338,8 @@ void sub_000E1B90(void)
  * change of the game's choice is logged as [FPS30].
  */
 extern void sub_000CC8F0_gen(void);
+extern void ssx3_CamPreUpdate(void);
+extern void ssx3_CamPostUpdate(uint32_t state);
 
 void sub_000CC8F0(void)
 {
@@ -337,7 +350,9 @@ void sub_000CC8F0(void)
         const char *e = getenv("RECOMP_FPS30");
         keep = e && *e && *e != '0';
     }
+    ssx3_CamPreUpdate();                  /* the modern race camera: camera_mode.c */
     sub_000CC8F0_gen();
+    ssx3_CamPostUpdate(self);
     app = MEM32(0x003A930Cu);
     if (app < 0x10000u)
         return;

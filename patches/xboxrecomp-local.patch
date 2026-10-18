@@ -506,7 +506,7 @@ index 83e652d..aa540a3 100644
  
  #endif /* APU_XAUDIO2_H */
 diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
-index a91edbe..ee75af3 100644
+index a91edbe..d0df986 100644
 --- a/src/input/xinput_device.c
 +++ b/src/input/xinput_device.c
 @@ -13,6 +13,135 @@
@@ -794,10 +794,11 @@ index a91edbe..ee75af3 100644
  
      xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
      xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-@@ -257,6 +411,54 @@ static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
+@@ -257,18 +411,82 @@ static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
  static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
  static DWORD g_packet[XBOX_MAX_CONTROLLERS];
  
+-/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
 +/* RECOMP_KEYBOARD=1: the keyboard as player 1, merged over any pad. Same map
 + * as the Windows backend; keys come from the framebuffer window as VK codes. */
 +extern int xbox_FramebufferKeyDown(int vk);
@@ -846,10 +847,79 @@ index a91edbe..ee75af3 100644
 +    if (!pState->Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb_axis(s_key[C_RSD], s_key[C_RSU]);
 +}
 +
- /* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
++/* Open attached game controllers into free slots (up to
++ * XBOX_MAX_CONTROLLERS); a pad that went away frees its slot. */
  static void open_controllers(void)
  {
-@@ -287,6 +489,13 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+-    int slot = 0;
+-    for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
++    for (int slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
++        if (g_pads[slot] && !SDL_GameControllerGetAttached(g_pads[slot])) {
++            SDL_GameControllerClose(g_pads[slot]);
++            g_pads[slot] = NULL;
++            g_controller_connected[slot] = FALSE;
++        }
++    for (int i = 0; i < SDL_NumJoysticks(); i++) {
++        SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
++        int slot, open = 0;
+         if (!SDL_IsGameController(i))
+             continue;
+-        if (!g_pads[slot]) {
+-            g_pads[slot] = SDL_GameControllerOpen(i);
+-            g_controller_connected[slot] = (g_pads[slot] != NULL);
+-        }
+-        slot++;
++        for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
++            if (g_pads[slot] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pads[slot])) == id)
++                open = 1;
++        if (open)
++            continue;
++        for (slot = 0; slot < XBOX_MAX_CONTROLLERS && g_pads[slot]; slot++)
++            ;
++        if (slot == XBOX_MAX_CONTROLLERS)
++            break;
++        g_pads[slot] = SDL_GameControllerOpen(i);
++        g_controller_connected[slot] = (g_pads[slot] != NULL);
++        if (g_pads[slot])
++            fprintf(stderr, "[INPUT] controller %d: %s\n", slot, SDL_GameControllerName(g_pads[slot]));
+     }
+ }
+ 
+@@ -279,14 +497,47 @@ void xbox_InputInit(void)
+     open_controllers();
+ }
+ 
++/* Set up on first use (nothing else calls xbox_InputInit on POSIX), then
++ * look for newly attached pads once a second while a slot is free. */
++static void input_poll_devices(void)
++{
++    static int inited;
++    static Uint32 next_scan;
++    int slot;
++    if (!inited) {
++        inited = 1;
++        xbox_InputInit();
++        next_scan = SDL_GetTicks() + 1000;
++        return;
++    }
++    if ((Sint32)(SDL_GetTicks() - next_scan) < 0)
++        return;
++    next_scan = SDL_GetTicks() + 1000;
++    for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
++        if (!g_pads[slot] || !SDL_GameControllerGetAttached(g_pads[slot])) {
++            SDL_GameControllerUpdate();     /* lets SDL notice new devices */
++            open_controllers();
++            break;
++        }
++}
++
+ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ {
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+         return ERROR_DEVICE_NOT_CONNECTED;
++    if (dwPort == 0)
++        input_poll_devices();
+ 
      SDL_GameController *c = g_pads[dwPort];
      if (!c || !SDL_GameControllerGetAttached(c)) {
          g_controller_connected[dwPort] = FALSE;
@@ -863,7 +933,7 @@ index a91edbe..ee75af3 100644
          return ERROR_DEVICE_NOT_CONNECTED;
      }
  
-@@ -335,6 +544,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+@@ -335,6 +586,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
      pState->Gamepad.sThumbRY =
          (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
  

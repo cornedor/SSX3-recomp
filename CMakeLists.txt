@@ -59,6 +59,7 @@ set(GAME_SOURCES
     src/ssx3_overrides.c
     src/thread_dump.c
     src/game_state.c
+    src/camera_mode.c
     src/autonav.c
     src/mmio_posix.c
     # Add game-specific sources here, e.g.:

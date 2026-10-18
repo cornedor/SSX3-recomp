@@ -958,12 +958,26 @@ All env defaults are set in `src/main.c` only when unset, so a run can override 
   RECOMP_GPU_VSH=0 + RECOMP_VKR_TRACE_BRIEF=<ms after the briefing> +
   RECOMP_VKR_TRACE_EVERY (per-draw boxes with depth range), RECOMP_VKR_CLEARLOG=1,
   work\probe\trails.ps1 (race start, N short brakes, shots).
+- MODERN RACE CAMERA (2026-10-18, off by default; launcher checkbox or
+  RECOMP_CAM=1):
+  src/camera_mode.c around the in-game update (sub_000CC8F0 wrapper): the
+  game's camera values are restored before each update and the chase
+  camera ([[state+0x84]+4], vtable 0x28630C) is rewritten after it --
+  spring-filtered eye offset (height slower) and view, look-ahead and roll
+  from the travel direction's turn rate, shake on landings (impact from
+  the vertical speed before Air -> Ground) and at speed; wider fov with
+  speed through the sub_0024EA13 wrapper (ssx3_CamFovScale). The eye is kept
+  out of the terrain with the world collision query (sub_001BD340 on a set
+  built by sub_001C0310 for the segment's box, as on the fps-mode branch). Knobs
+  RECOMP_CAM_SMOOTH/_FOV/_ROLL/_SHAKE, RECOMP_CAM_TRACE.
 - MOTION BLUR (2026-10-17, off by default; launcher checkbox or
   RECOMP_MBLUR=<strength>): scene pass before the HUD (src/vk/shaders/
   scene.frag) -- camera blur by reprojection plus radial speed streaks from
   the heading, scaled by camera speed and distance; McGuire 2012 depth
-  weights; riders and boards (E9FDBED0, 5D983485) tagged in alpha and kept
-  sharp. Camera fitted from the terrain program each frame (scene_camera,
+  weights; player 1's rider and board (E9FDBED0, 5D983485 draws whose first
+  vertex, unprojected through the fitted camera, lies within 3 m of
+  ssx3_PlayerPos) tagged in alpha and kept sharp; the other riders blur
+  with the scene (RECOMP_MBLUR_RIDERS=1: all riders sharp, the old way). Camera fitted from the terrain program each frame (scene_camera,
   +-h steps: a unit step jittered). Knobs: RECOMP_SCENE_PARAMS (speed, s0,
   s1, reach, edge, cap, near, mindist). Test: RECOMP_AUTONAV=race +
   RECOMP_MBLUR_TEST=<dir> (blur/ref PPM pairs, [MBLUR-TEST] speed and

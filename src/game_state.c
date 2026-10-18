@@ -29,6 +29,7 @@
 #include "recomp/gen/recomp_types.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 #define APP_PTR_VA 0x003A930Cu
 
@@ -176,4 +177,20 @@ void ssx3_GameStateStart(void)
     if (e && e[0] == '0')
         return;
     CloseHandle(CreateThread(NULL, 0, game_state_thread, NULL, 0, NULL));
+}
+
+/* Player 1's rider position (world, Z-up), for the motion blur (vkr_backend.c
+ * keeps only this rider sharp). The rider manager [[[0x369534]+0x74]+0xC]
+ * (vtable 0x0028216C) holds the riders at +0x28 + 4*i, slot 0 = player 1;
+ * a rider's position is at +0x180. 0 outside a race. */
+int ssx3_PlayerPos(float out[3])
+{
+    uint32_t g = MEM32(0x00369534u), a, m, b;
+    if (!guest_ok(g) || !guest_ok(a = MEM32(g + 0x74)) || !guest_ok(m = MEM32(a + 0xC))
+            || MEM32(m) != 0x0028216Cu || !guest_ok(b = MEM32(m + 0x28)))
+        return 0;
+    out[0] = MEMF(b + 0x180);
+    out[1] = MEMF(b + 0x184);
+    out[2] = MEMF(b + 0x188);
+    return isfinite(out[0]) && isfinite(out[1]) && isfinite(out[2]);
 }

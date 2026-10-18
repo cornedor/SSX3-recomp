@@ -654,6 +654,10 @@ static struct {
     double m[4][4];             /* rows: x w, y w, z w, w */
     double eye[3];
 } s_cam;
+static double s_cam_inv[4][4];  /* the last fitted camera's inverse */
+static uint32_t s_rider_sharp, s_rider_blur;  /* rider draws (RECOMP_MBLUR_TRACE) */
+static int s_cam_inv_ok;
+static int inv4(double a[4][4], double r[4][4]);
 
 /* Program lists from the environment (hex, comma separated), with a default. */
 static int prog_list(const char *env, const char *def, uint32_t *out, int max)
@@ -769,6 +773,44 @@ static void scene_camera(const float *in, const Nv2aVshProgram *p)
         for (i = 0; i < 3; i++) s_cam.eye[i] = a[i][3] / a[i][i];
     }
     s_cam.valid = 1;
+    s_cam_inv_ok = inv4(s_cam.m, s_cam_inv);
+}
+
+/* Of the rider draws, only player 1's stays sharp: the draw's first vertex,
+ * taken back to the world through the last fitted camera, lies within 3 m
+ * of player 1's position (ssx3_PlayerPos, game_state.c). The other riders
+ * are blurred with the scene. RECOMP_MBLUR_RIDERS=1 keeps every rider
+ * sharp. */
+extern int ssx3_PlayerPos(float out[3]);
+
+static int player_draw(const float *in, const Nv2aVshProgram *p)
+{
+    static int all = -1;
+    float vin[NV2A_VSH_INPUTS][4], pp[3];
+    double v[4], wp[4], d2 = 0.0;
+    Nv2aVshOutput o;
+    int a, r;
+    if (all < 0) {
+        const char *e = getenv("RECOMP_MBLUR_RIDERS");
+        all = e && *e && *e != '0';
+    }
+    if (all || !s_cam_inv_ok || !ssx3_PlayerPos(pp))
+        return 1;
+    memset(vin, 0, sizeof vin);
+    for (a = 0; a < NV2A_VSH_INPUTS; a++)
+        if (p->in_slot[a] != 0xFF)
+            memcpy(vin[a], in + p->in_slot[a] * 4, sizeof vin[a]);
+    if (!nv2a_vsh_run((const float (*)[4])vin, &o) || !(o.pos[3] > 0.0f))
+        return 1;
+    v[0] = (double)o.pos[0] * o.pos[3]; v[1] = (double)o.pos[1] * o.pos[3];
+    v[2] = (double)o.pos[2] * o.pos[3]; v[3] = o.pos[3];
+    for (r = 0; r < 4; r++)
+        wp[r] = s_cam_inv[r][0] * v[0] + s_cam_inv[r][1] * v[1] + s_cam_inv[r][2] * v[2] + s_cam_inv[r][3] * v[3];
+    if (fabs(wp[3]) < 1e-9)
+        return 1;
+    for (r = 0; r < 3; r++)
+        d2 += (wp[r] / wp[3] - pp[r]) * (wp[r] / wp[3] - pp[r]);
+    return d2 < 300.0 * 300.0;
 }
 
 /* 4x4 inverse (Gauss-Jordan, partial pivoting); 0 if singular. */
@@ -904,7 +946,9 @@ static void scene_flip(void)
         wpx = fmax(wpx, s_mb_px);
         if (tr && now_ms() - last > 1000.0) {
             fprintf(stderr, "[MBLUR] speed %.1f/frame (%.0f km/h at 60 Hz), reprojection max %.2f px,"
-                    " pass at draw %u of %u\n", speed, speed * 60.0 * 0.036, wpx, s_mb_at_draw, s_draw_total);
+                    " pass at draw %u of %u; rider draws sharp %u, blurred %u\n", speed, speed * 60.0 * 0.036,
+                    wpx, s_mb_at_draw, s_draw_total, s_rider_sharp, s_rider_blur);
+            s_rider_sharp = s_rider_blur = 0;
             last = now_ms();
             wpx = 0.0;
         }
@@ -1104,7 +1148,11 @@ static int be_draw_vsh(const Nv2aTarget *t, uint32_t prim, const float *in, uint
                 }
             }
         }
-        st.rider = rider_program(p->hash);
+        st.rider = 0;
+        if (rider_program(p->hash)) {
+            st.rider = player_draw(in, p);
+            if (st.rider) s_rider_sharp++; else s_rider_blur++;
+        }
         s_draw_no++;
         if (s_cam.valid && !s_scene_ran && n) {
             float z0 = 0.0f, w0 = vsh_first_w(in, p, &z0);

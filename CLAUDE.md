@@ -975,6 +975,9 @@ All env defaults are set in `src/main.c` only when unset, so a run can override 
   numbers); the 120-frame line also prints render passes per frame (~3).
   Linux snapshots (RECOMP_SNAP_TRIGGER) now write the full-resolution frame
   the window shows (it wrote a stale 640x480 one).
+  Video: RECOMP_RECORD=<file.mkv> (vkr_backend.c record_frame) pipes every
+  full-resolution frame, gamma applied, to ffmpeg as 60 FPS H.264;
+  RECOMP_RECORD_INGAME=1 starts at the first in-game frame.
   OPEN: intermittent abort at boot, `malloc(): unaligned tcache chunk
   detected` in the SDL window thread's SDL_CreateTexture (fb_thread, first
   full-resolution frame), ~3 in 35 boots, with RECOMP_VKR_SPEC on and off;

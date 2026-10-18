@@ -101,6 +101,52 @@ static pthread_cond_t s_job_cond = PTHREAD_COND_INITIALIZER;
 volatile uint32_t ssx3_last_flip_ms, ssx3_exec_tid, ssx3_flip_tid;
 extern uint32_t xbox_TickCountMs(void);
 
+/* RECOMP_RECORD=<file.mkv>: every full-resolution frame, gamma applied,
+ * piped to ffmpeg as 60 FPS H.264 (Matroska survives a killed process).
+ * Stops when the frame size changes. RECOMP_RECORD_INGAME=1: starts at the
+ * first in-game frame (briefing / race). */
+extern void xbox_FramebufferApplyGamma(uint32_t *px, size_t n);
+extern int ssx3_InGame(void);
+
+static void record_frame(const uint8_t *px, uint32_t w, uint32_t h)
+{
+    static int state;           /* 0 unchecked, 1 recording, -1 off */
+    static FILE *pipe;
+    static uint32_t rw, rh, *buf;
+    if (state == 0) {
+        const char *path = getenv("RECOMP_RECORD");
+        char cmd[1024];
+        if (path && *path && getenv("RECOMP_RECORD_INGAME") && !ssx3_InGame())
+            return;
+        state = -1;
+        if (!path || !*path || !(buf = (uint32_t *)malloc((size_t)w * h * 4)))
+            return;
+        snprintf(cmd, sizeof cmd, "ffmpeg -y -loglevel error -f rawvideo -pix_fmt bgra"
+                 " -s %ux%u -framerate 60 -i - -c:v libx264 -preset veryfast -crf 16"
+                 " -pix_fmt yuv420p \"%s\"", w, h, path);
+#ifdef _WIN32
+        pipe = _popen(cmd, "wb");
+#else
+        pipe = popen(cmd, "w");
+#endif
+        if (!pipe)
+            return;
+        rw = w; rh = h; state = 1;
+        fprintf(stderr, "[RECORD] %ux%u to %s\n", w, h, path);
+    }
+    if (state != 1)
+        return;
+    if (w != rw || h != rh) {
+        fprintf(stderr, "[RECORD] frame size changed: stopped\n");
+        fclose(pipe);
+        state = -1;
+        return;
+    }
+    memcpy(buf, px, (size_t)w * h * 4);
+    xbox_FramebufferApplyGamma(buf, (size_t)w * h);
+    fwrite(buf, 4, (size_t)w * h, pipe);
+}
+
 static void *flip_thread(void *unused)
 {
     (void)unused;
@@ -126,8 +172,10 @@ static void *flip_thread(void *unused)
                        px + (size_t)y * j.w * 4, (size_t)j.w * 4);
             /* Higher internal resolution: the window shows the full image. */
             full = vkr_frame_pixels_full(s_vk, j.slot, &fw, &fh);
-            if (full)
+            if (full) {
                 xbox_FramebufferPublishImage((const uint32_t *)full, fw, fh);
+                record_frame(full, fw, fh);
+            }
             if (full && j.shot)
                 mbtest_write(&j, full, fw, fh);
         }

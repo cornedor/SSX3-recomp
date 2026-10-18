@@ -40,6 +40,8 @@ static double vkr_now_ms(void)
 
 #define VKR_BUF_BYTES (32u << 20)       /* vertex+index staging per frame */
 #define VKR_FRAMES 2                    /* frames in flight */
+#define VKR_SPEC_WORDS 39               /* xbox.frag SPEC + S0..S37 */
+#define VKR_PIPE_INDEX 8192
 
 struct VkrTex {
     uint64_t key;
@@ -67,6 +69,7 @@ typedef struct {
     VkQueryPool qp;
     uint32_t nq;
     int qreset;
+    uint32_t npass;                 /* render passes begun in the frame */
     struct VkrProfDraw *meta;
 } VkrFrame;
 
@@ -102,8 +105,24 @@ struct VkrContext {
     int dual_src;                              /* dualSrcBlend enabled */
     int tags;                                  /* rider tags on: main-target draws write theirs to alpha */
 
-    struct PipeEntry { uint32_t key[8]; VkPipeline pipe; } pipes[200];
-    int npipes;
+    /* Pipelines by key: blend/topology/... (8 words) + the fragment
+     * shader's specialization (VKR_SPEC_WORDS, see spec_words). A
+     * specialized one is compiled by the worker (pipe_worker) while draws
+     * use the interpreting one; pipe stays VK_NULL_HANDLE until then. */
+    struct PipeEntry {
+        uint32_t key[8 + VKR_SPEC_WORDS];
+        VkPipeline pipe;                /* render thread */
+        VkPipeline built;               /* the worker's result, under pj_lock */
+        struct PipeEntry *next_job;
+        int pending;                    /* queued or compiling (render thread) */
+    } **pipes;
+    int npipes, cappipes;
+    int pipe_index[VKR_PIPE_INDEX];     /* open addressing: pipes[] index + 1, 0 = empty */
+    int spec, spec_sync;                /* RECOMP_VKR_SPEC (default 1), RECOMP_VKR_SPEC_SYNC */
+    pthread_mutex_t pj_lock;
+    pthread_cond_t pj_cond;
+    struct PipeEntry *pj_head, *pj_tail;
+    int pj_started, pj_quit, pj_done;
     struct SamplerEntry { uint32_t key; VkSampler s; } samplers[16];
     int nsamplers;
 
@@ -159,6 +178,7 @@ struct VkrContext {
     /* RECOMP_VKR_GPUPROF=<ms> */
     double prof_thr, ts_period;
     unsigned prof_said;
+    int prof_frame;                 /* RECOMP_VKR_GPUPROF_FRAME=1: frame start/end only */
     float vsh_consts[192][4];
 
     /* RECOMP_CRT=1: CRT post-process of the full-resolution image (crt.frag).
@@ -416,6 +436,14 @@ static int make_layout(VkrContext *c)
     VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
 
     c->vs = shader(c, xbox_vert_spv, xbox_vert_spv_len);
+    {
+        /* RECOMP_VKR_SPEC=0: one fragment pipeline per blend state that
+         * interprets the combiners (spec_words) */
+        const char *e = getenv("RECOMP_VKR_SPEC");
+        c->spec = !(e && *e == '0');
+        /* RECOMP_VKR_SPEC_SYNC=1: compile them on the spot (the draw waits) */
+        c->spec_sync = getenv("RECOMP_VKR_SPEC_SYNC") != NULL;
+    }
     c->fs = shader(c, xbox_frag_spv, xbox_frag_spv_len);
     c->fs_wdepth = shader(c, xbox_frag_wdepth_spv, xbox_frag_wdepth_spv_len);
     c->vs_vsh = shader(c, xbox_vsh_vert_spv, xbox_vsh_vert_spv_len);
@@ -625,10 +653,45 @@ void vkr_scene_set(VkrContext *c, const VkrScene *s)
     c->cam_valid = 1;
 }
 
-/* Pipeline for one blend/write-mask combination (depth state is dynamic). */
-static VkPipeline get_pipeline(VkrContext *c, const VkrDrawState *st, int gpu_vsh)
+/* The fragment shader's specialization constants (xbox.frag SPEC, S0..S37):
+ * the combiner words that shape the program, so the compiler folds the
+ * interpreter away. Words the shader does not read for this state are 0, so
+ * they do not make extra pipelines. All 0 = the interpreter (RECOMP_VKR_SPEC=0). */
+static void spec_words(const VkrContext *c, const VkrDrawState *st, uint32_t *w)
 {
-    uint32_t key[8];
+    const VkrUniforms *u = &st->u;
+    uint32_t n = u->control & 255u, s;
+    memset(w, 0, VKR_SPEC_WORDS * sizeof *w);
+    if (!c->spec)
+        return;
+    w[0] = 1;
+    w[38] = st->alpha_func;
+    if (!u->rc_seen) {
+        w[36] = u->stage_program & 31u;
+        return;
+    }
+    if (n > 8) n = 8;
+    for (s = 0; s < n; s++) {
+        w[1 + s] = u->color_icw[s];  w[9 + s] = u->alpha_icw[s];
+        w[17 + s] = u->color_ocw[s]; w[25 + s] = u->alpha_ocw[s];
+    }
+    w[33] = u->final0; w[34] = u->final1;
+    w[35] = u->control; w[36] = u->stage_program; w[37] = u->rc_seen;
+}
+
+static uint32_t pipe_hash(const uint32_t *key)
+{
+    uint32_t h = 2166136261u, i;
+    for (i = 0; i < 8 + VKR_SPEC_WORDS; i++)
+        h = (h ^ key[i]) * 16777619u;
+    return h;
+}
+
+/* The pipeline for a key (get_pipeline). */
+static VkPipeline create_pipeline(VkrContext *c, const uint32_t *key)
+{
+    VkSpecializationMapEntry sme[VKR_SPEC_WORDS];
+    VkSpecializationInfo spi;
     VkPipelineShaderStageCreateInfo stg[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_VERTEX_BIT, 0, "main", 0},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_FRAGMENT_BIT, 0, "main", 0},
@@ -654,32 +717,20 @@ static VkPipeline get_pipeline(VkrContext *c, const VkrDrawState *st, int gpu_vs
     VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     VkGraphicsPipelineCreateInfo pi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     VkPipeline pipe;
-    int i;
+    int blend = (int)key[0], gpu_vsh = (int)key[5], w_buffer = (int)(key[7] & 1u), i;
+    uint32_t topology = key[6], write_mask = key[4];
 
-    key[0] = (uint32_t)st->blend_enable; key[1] = st->blend_src; key[2] = st->blend_dst;
-    key[3] = st->blend_eq; key[4] = st->write_mask;
-    if (!st->blend_enable) key[1] = key[2] = key[3] = 0;
-    key[5] = (uint32_t)gpu_vsh;
-    key[6] = st->topology;
-    key[7] = (uint32_t)(st->w_buffer != 0);
-    if (c->tags) {
-        /* tagged: the tag goes to alpha where the draw writes depth, the
-         * alpha underneath stays where it does not */
-        key[7] |= 16u;
-        if (st->depth_test && st->depth_write)
-            key[7] |= 32u;
-    }
-    for (i = 0; i < c->npipes; i++)
-        if (!memcmp(c->pipes[i].key, key, sizeof key))
-            return c->pipes[i].pipe;
-    if (c->npipes == (int)(sizeof c->pipes / sizeof c->pipes[0])) {
-        fprintf(stderr, "[VKR] pipeline cache full\n");
-        return VK_NULL_HANDLE;
-    }
-
-    stg[0].module = gpu_vsh ? c->vs_vsh : c->vs; stg[1].module = st->w_buffer ? c->fs_wdepth : c->fs;
+    stg[0].module = gpu_vsh ? c->vs_vsh : c->vs; stg[1].module = w_buffer ? c->fs_wdepth : c->fs;
     if (key[7] & 16u)
-        stg[1].module = c->fs_tags[st->w_buffer ? 1 : 0];
+        stg[1].module = c->fs_tags[w_buffer];
+    for (i = 0; i < VKR_SPEC_WORDS; i++) {
+        sme[i].constantID = (uint32_t)i;
+        sme[i].offset = (uint32_t)(i * 4);
+        sme[i].size = 4;
+    }
+    spi.mapEntryCount = VKR_SPEC_WORDS; spi.pMapEntries = sme;
+    spi.dataSize = VKR_SPEC_WORDS * sizeof key[0]; spi.pData = key + 8;
+    stg[1].pSpecializationInfo = &spi;
     for (i = 0; i < 8; i++) {
         at[i].location = (uint32_t)i; at[i].binding = 0;
         at[i].format = VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -689,8 +740,8 @@ static VkPipeline get_pipeline(VkrContext *c, const VkrDrawState *st, int gpu_vs
         vin.vertexBindingDescriptionCount = 1; vin.pVertexBindingDescriptions = &bind;
         vin.vertexAttributeDescriptionCount = 8; vin.pVertexAttributeDescriptions = at;
     }
-    ia.topology = st->topology == VKR_TOPO_LINES  ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
-                : st->topology == VKR_TOPO_POINTS ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+    ia.topology = topology == VKR_TOPO_LINES  ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                : topology == VKR_TOPO_POINTS ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
                 : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     vp.viewportCount = 1; vp.scissorCount = 1;
     rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
@@ -698,15 +749,15 @@ static VkPipeline get_pipeline(VkrContext *c, const VkrDrawState *st, int gpu_vs
     rs.lineWidth = c->wide_lines ? (c->scale < c->max_line ? c->scale : c->max_line) : 1.0f;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    cba.colorWriteMask = st->write_mask & 0xF;
+    cba.colorWriteMask = write_mask & 0xF;
     if (key[7] & 16u) {
         /* rider tags: colour blends with the real alpha (second source),
          * alpha takes the tag; a draw that writes no colour leaves both alone */
         cba.blendEnable = VK_TRUE;
-        if (st->blend_enable) {
-            cba.srcColorBlendFactor = src1_factor(blend_factor(st->blend_src));
-            cba.dstColorBlendFactor = src1_factor(blend_factor(st->blend_dst));
-            cba.colorBlendOp = blend_op(st->blend_eq);
+        if (blend) {
+            cba.srcColorBlendFactor = src1_factor(blend_factor(key[1]));
+            cba.dstColorBlendFactor = src1_factor(blend_factor(key[2]));
+            cba.colorBlendOp = blend_op(key[3]);
         } else {
             cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
             cba.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
@@ -717,11 +768,11 @@ static VkPipeline get_pipeline(VkrContext *c, const VkrDrawState *st, int gpu_vs
         cba.alphaBlendOp = VK_BLEND_OP_ADD;
         if (cba.colorWriteMask & 7u)
             cba.colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
-    } else if (st->blend_enable) {
+    } else if (blend) {
         cba.blendEnable = VK_TRUE;
-        cba.srcColorBlendFactor = cba.srcAlphaBlendFactor = blend_factor(st->blend_src);
-        cba.dstColorBlendFactor = cba.dstAlphaBlendFactor = blend_factor(st->blend_dst);
-        cba.colorBlendOp = cba.alphaBlendOp = blend_op(st->blend_eq);
+        cba.srcColorBlendFactor = cba.srcAlphaBlendFactor = blend_factor(key[1]);
+        cba.dstColorBlendFactor = cba.dstAlphaBlendFactor = blend_factor(key[2]);
+        cba.colorBlendOp = cba.alphaBlendOp = blend_op(key[3]);
     }
     cb.attachmentCount = 1; cb.pAttachments = &cba;
     dy.dynamicStateCount = (uint32_t)(sizeof dyn / sizeof dyn[0]); dy.pDynamicStates = dyn;
@@ -739,13 +790,135 @@ static VkPipeline get_pipeline(VkrContext *c, const VkrDrawState *st, int gpu_vs
             fprintf(stderr, "[VKR] pipeline creation failed\n");
             return VK_NULL_HANDLE;
         }
-        fprintf(stderr, "[VKR] pipeline %d: %.1f ms (blend %u %u/%u eq %u mask %X vsh %u topo %u wdepth %u)\n",
-                c->npipes, vkr_now_ms() - t0,
-                key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
+        fprintf(stderr, "[VKR] pipeline: %.1f ms (blend %u %u/%u eq %u mask %X vsh %u topo %u wdepth %u"
+                " rc %u stages %u)\n", vkr_now_ms() - t0,
+                key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                key[8], key[8 + 35] & 255u);
     }
-    memcpy(c->pipes[c->npipes].key, key, sizeof key);
-    c->pipes[c->npipes++].pipe = pipe;
     return pipe;
+}
+
+/* Compiles specialized pipelines in the background: one took ~90 ms on
+ * Honeykrisp (once; Mesa's disk cache has it after that). */
+static void *pipe_worker(void *arg)
+{
+    VkrContext *c = (VkrContext *)arg;
+    pthread_mutex_lock(&c->pj_lock);
+    for (;;) {
+        struct PipeEntry *e;
+        VkPipeline p;
+        while (!c->pj_head && !c->pj_quit)
+            pthread_cond_wait(&c->pj_cond, &c->pj_lock);
+        if (c->pj_quit)
+            break;
+        e = c->pj_head;
+        c->pj_head = e->next_job;
+        if (!c->pj_head)
+            c->pj_tail = NULL;
+        pthread_mutex_unlock(&c->pj_lock);
+        p = create_pipeline(c, e->key);
+        pthread_mutex_lock(&c->pj_lock);
+        e->built = p;
+        e->next_job = e;                /* done, even if it failed */
+    }
+    c->pj_done = 1;
+    pthread_cond_broadcast(&c->pj_cond);
+    pthread_mutex_unlock(&c->pj_lock);
+    return NULL;
+}
+
+/* The entry for a key, made (and its pipeline created or queued) on a miss. */
+static struct PipeEntry *pipe_entry(VkrContext *c, const uint32_t *key)
+{
+    struct PipeEntry *e;
+    uint32_t slot;
+    for (slot = pipe_hash(key) % VKR_PIPE_INDEX; c->pipe_index[slot]; slot = (slot + 1) % VKR_PIPE_INDEX)
+        if (!memcmp(c->pipes[c->pipe_index[slot] - 1]->key, key, sizeof e->key))
+            return c->pipes[c->pipe_index[slot] - 1];
+    if (c->npipes >= VKR_PIPE_INDEX / 2) {
+        fprintf(stderr, "[VKR] pipeline cache full\n");
+        return NULL;
+    }
+    if (c->npipes == c->cappipes) {
+        struct PipeEntry **np;
+        int cap = c->cappipes ? c->cappipes * 2 : 256;
+        if (!(np = (struct PipeEntry **)realloc(c->pipes, (size_t)cap * sizeof *np)))
+            return NULL;
+        c->pipes = np;
+        c->cappipes = cap;
+    }
+    if (!(e = (struct PipeEntry *)calloc(1, sizeof *e)))
+        return NULL;
+    memcpy(e->key, key, sizeof e->key);
+    if (!key[8] || c->spec_sync) {
+        e->pipe = create_pipeline(c, key);
+    } else {
+        if (!c->pj_started) {
+            pthread_t th;
+            pthread_mutex_init(&c->pj_lock, NULL);
+            pthread_cond_init(&c->pj_cond, NULL);
+            if (pthread_create(&th, NULL, pipe_worker, c) != 0) {
+                c->spec_sync = 1;
+                e->pipe = create_pipeline(c, key);
+                goto add;
+            }
+            pthread_detach(th);
+            c->pj_started = 1;
+        }
+        pthread_mutex_lock(&c->pj_lock);
+        if (c->pj_tail)
+            c->pj_tail->next_job = e;
+        else
+            c->pj_head = e;
+        c->pj_tail = e;
+        e->pending = 1;
+        pthread_cond_signal(&c->pj_cond);
+        pthread_mutex_unlock(&c->pj_lock);
+    }
+add:
+    c->pipes[c->npipes] = e;
+    c->pipe_index[slot] = ++c->npipes;
+    return e;
+}
+
+/* Pipeline for one blend/write-mask/combiner combination (depth state is
+ * dynamic): the specialized one once it is compiled, until then (or if it
+ * failed) the interpreting one. */
+static VkPipeline get_pipeline(VkrContext *c, const VkrDrawState *st, int gpu_vsh)
+{
+    uint32_t key[8 + VKR_SPEC_WORDS];
+    struct PipeEntry *e;
+    VkPipeline p;
+
+    key[0] = (uint32_t)st->blend_enable; key[1] = st->blend_src; key[2] = st->blend_dst;
+    key[3] = st->blend_eq; key[4] = st->write_mask;
+    if (!st->blend_enable) key[1] = key[2] = key[3] = 0;
+    key[5] = (uint32_t)gpu_vsh;
+    key[6] = st->topology;
+    key[7] = (uint32_t)(st->w_buffer != 0);
+    if (c->tags) {
+        /* tagged: the tag goes to alpha where the draw writes depth, the
+         * alpha underneath stays where it does not */
+        key[7] |= 16u;
+        if (st->depth_test && st->depth_write)
+            key[7] |= 32u;
+    }
+    spec_words(c, st, key + 8);
+    if (!(e = pipe_entry(c, key)))
+        return VK_NULL_HANDLE;
+    if (e->pending) {
+        pthread_mutex_lock(&c->pj_lock);
+        if (e->next_job == e) {
+            e->pipe = e->built;
+            e->pending = 0;
+        }
+        pthread_mutex_unlock(&c->pj_lock);
+    }
+    if ((p = e->pipe) || !key[8])
+        return p;
+    memset(key + 8, 0, VKR_SPEC_WORDS * sizeof key[0]);
+    e = pipe_entry(c, key);
+    return e ? e->pipe : VK_NULL_HANDLE;
 }
 
 static VkSampler get_sampler(VkrContext *c, uint32_t au, uint32_t av, int linear)
@@ -890,6 +1063,7 @@ VkrContext *vkr_create(void)
             VkQueryPoolCreateInfo qpi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             qpi.queryType = VK_QUERY_TYPE_TIMESTAMP; qpi.queryCount = VKR_PROF_MAX;
             c->prof_thr = atof(e);
+            c->prof_frame = getenv("RECOMP_VKR_GPUPROF_FRAME") != NULL;
             c->ts_period = pp.limits.timestampPeriod;
             for (f = 0; f < VKR_FRAMES; f++) {
                 if (vkCreateQueryPool(c->dev, &qpi, NULL, &c->fr[f].qp) != VK_SUCCESS
@@ -1077,8 +1251,20 @@ void vkr_destroy(VkrContext *c)
     free_target(c);
     vkDeviceWaitIdle(c->dev);
     tex_free_all(c);
-    for (int i = 0; i < c->npipes; i++)
-        vkDestroyPipeline(c->dev, c->pipes[i].pipe, NULL);
+    if (c->pj_started) {
+        pthread_mutex_lock(&c->pj_lock);
+        c->pj_quit = 1;
+        pthread_cond_broadcast(&c->pj_cond);
+        while (!c->pj_done)
+            pthread_cond_wait(&c->pj_cond, &c->pj_lock);
+        pthread_mutex_unlock(&c->pj_lock);
+    }
+    for (int i = 0; i < c->npipes; i++) {
+        if (c->pipes[i]->pipe)
+            vkDestroyPipeline(c->dev, c->pipes[i]->pipe, NULL);
+        free(c->pipes[i]);
+    }
+    free(c->pipes);
     for (int i = 0; i < c->nsamplers; i++)
         vkDestroySampler(c->dev, c->samplers[i].s, NULL);
     vkDestroyShaderModule(c->dev, c->vs, NULL);
@@ -1217,7 +1403,7 @@ static void prof_mark(VkrContext *c, const VkrDrawState *st, uint32_t nidx, int 
 {
     VkrFrame *fr = &c->fr[c->cur];
     VkrProfDraw *m;
-    if (c->prof_thr <= 0 || !fr->qreset || fr->nq >= VKR_PROF_MAX)
+    if (c->prof_thr <= 0 || !fr->qreset || fr->nq >= VKR_PROF_MAX || (st && c->prof_frame))
         return;
     m = &fr->meta[fr->nq];
     memset(m, 0, sizeof *m);
@@ -1252,12 +1438,14 @@ static void prof_report(VkrContext *c, int slot)
     {
         /* every 120 frames: the GPU frame time's average and maximum */
         static double sum, mx;
-        static unsigned nf;
+        static unsigned nf, passes;
         sum += total; nf++;
+        passes += fr->npass;
         if (total > mx) mx = total;
         if (nf == 120) {
-            fprintf(stderr, "[GPUPROF] 120 frames: GPU avg %.2f ms, max %.2f ms\n", sum / nf, mx);
-            sum = mx = 0; nf = 0;
+            fprintf(stderr, "[GPUPROF] 120 frames: GPU avg %.2f ms, max %.2f ms, %.1f passes\n",
+                    sum / nf, mx, (double)passes / nf);
+            sum = mx = 0; nf = passes = 0;
         }
     }
     if (total < c->prof_thr || c->prof_said >= 60)
@@ -1307,6 +1495,7 @@ static int begin_cmd(VkrContext *c)
         vkCmdResetQueryPool(c->cmd, c->fr[c->cur].qp, 0, VKR_PROF_MAX);
         c->fr[c->cur].qreset = 1;
         c->fr[c->cur].nq = 0;
+        c->fr[c->cur].npass = 0;
         prof_mark(c, NULL, 0, -1);
     }
     barrier(c, c->color, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -1332,6 +1521,7 @@ static void begin_pass(VkrContext *c)
     VkViewport vp = {0, 0, (float)c->sw, (float)c->sh, 0.0f, 1.0f};
     VkRect2D sc = {{0, 0}, {c->sw, c->sh}};   /* render area: the whole target */
     if (c->in_pass) return;
+    c->fr[c->cur].npass++;
     ca.imageView = c->color_view; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     ca.loadOp = c->color_valid ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
     ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;

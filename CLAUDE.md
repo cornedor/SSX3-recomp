@@ -958,6 +958,29 @@ All env defaults are set in `src/main.c` only when unset, so a run can override 
   RECOMP_GPU_VSH=0 + RECOMP_VKR_TRACE_BRIEF=<ms after the briefing> +
   RECOMP_VKR_TRACE_EVERY (per-draw boxes with depth range), RECOMP_VKR_CLEARLOG=1,
   work\probe\trails.ps1 (race start, N short brakes, shots).
+- COMBINER SPECIALIZATION (2026-10-18, Linux/Asahi M2 Max: race 37-55 FPS
+  at 1728x1080, GPU-bound): xbox.frag interpreted the register combiners
+  per pixel (R[16] indexed by uniform words) -- ~80% of the GPU time on
+  Honeykrisp (12 ms/frame vs 2.4 ms with a trivial shader; a switch-based
+  register file instead of the array was far worse, 145 ms). Now the
+  combiner words, stage count and alpha func are specialization constants
+  (xbox.frag SPEC + S0..S37, vkr.c spec_words; stages unrolled by hand) and
+  part of the pipeline key (hash-indexed). A new specialized pipeline takes
+  ~90 ms to compile cold on Honeykrisp, so a worker thread builds it
+  (pipe_worker) while draws use the interpreting pipeline; Mesa's disk cache
+  has it after the first time. Race: GPU 12 -> 2.2 ms/frame, steady 60 FPS.
+  RECOMP_VKR_SPEC=0 = interpreter only, RECOMP_VKR_SPEC_SYNC=1 = compile
+  on the spot. RECOMP_VKR_GPUPROF_FRAME=1: frame start/end timestamps only
+  (per-draw timestamps split the render pass on a tiler and inflate the
+  numbers); the 120-frame line also prints render passes per frame (~3).
+  Linux snapshots (RECOMP_SNAP_TRIGGER) now write the full-resolution frame
+  the window shows (it wrote a stale 640x480 one).
+  OPEN: intermittent abort at boot, `malloc(): unaligned tcache chunk
+  detected` in the SDL window thread's SDL_CreateTexture (fb_thread, first
+  full-resolution frame), ~3 in 35 boots, with RECOMP_VKR_SPEC on and off;
+  a core from before this work exists too (coredumpctl list ssx3_recomp).
+  Heap corrupted earlier by something else; suspect around the target
+  resize at boot (vkr_set_target / flip_thread reading c->sw x c->sh).
 - MODERN RACE CAMERA (2026-10-18, off by default; launcher checkbox or
   RECOMP_CAM=1):
   src/camera_mode.c around the in-game update (sub_000CC8F0 wrapper): the

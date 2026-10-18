@@ -6666,10 +6666,10 @@ index 08bae4b..1b0e0d8 100644
  #endif
 diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
 new file mode 100644
-index 0000000..748ee10
+index 0000000..dce3d21
 --- /dev/null
 +++ b/src/video/fb_present_sdl.c
-@@ -0,0 +1,437 @@
+@@ -0,0 +1,446 @@
 +/**
 + * POSIX counterpart of fb_present.c: show the guest framebuffer in an SDL2
 + * window. Same contract (RECOMP_FB_WINDOW, flip-time copy, BMP dump, snap
@@ -6889,15 +6889,13 @@ index 0000000..748ee10
 +
 +static int s_dump_quiet;
 +
-+int xbox_FramebufferDumpBmp(const char *path)
++static int write_bmp(const char *path, const uint32_t *px, uint32_t w, uint32_t h)
 +{
 +    FILE *f;
-+    uint32_t row = ((s_fb_width * 3u) + 3u) & ~3u;
-+    uint32_t img = row * s_fb_height, total = 54u + img, y, x;
++    uint32_t row = ((w * 3u) + 3u) & ~3u;
++    uint32_t img = row * h, total = 54u + img, y, x;
 +    uint8_t hdr[54], *line;
 +
-+    if (!s_rgb || !s_fb_va)
-+        return -1;
 +    f = fopen(path, "wb");
 +    if (!f)
 +        return -1;
@@ -6905,15 +6903,15 @@ index 0000000..748ee10
 +    hdr[0] = 'B'; hdr[1] = 'M';
 +    memcpy(hdr + 2, &total, 4);
 +    hdr[10] = 54; hdr[14] = 40;
-+    memcpy(hdr + 18, &s_fb_width, 4);
-+    memcpy(hdr + 22, &s_fb_height, 4);
++    memcpy(hdr + 18, &w, 4);
++    memcpy(hdr + 22, &h, 4);
 +    hdr[26] = 1; hdr[28] = 24;
 +    memcpy(hdr + 34, &img, 4);
 +    fwrite(hdr, 1, sizeof(hdr), f);
 +    line = (uint8_t *)calloc(1, row);
-+    for (y = 0; y < s_fb_height; y++) {
-+        const uint32_t *src = s_rgb + (size_t)(s_fb_height - 1 - y) * s_fb_width;
-+        for (x = 0; x < s_fb_width; x++) {
++    for (y = 0; y < h; y++) {
++        const uint32_t *src = px + (size_t)(h - 1 - y) * w;
++        for (x = 0; x < w; x++) {
 +            line[x * 3 + 0] = (uint8_t)(src[x] & 0xFF);
 +            line[x * 3 + 1] = (uint8_t)((src[x] >> 8) & 0xFF);
 +            line[x * 3 + 2] = (uint8_t)((src[x] >> 16) & 0xFF);
@@ -6922,6 +6920,13 @@ index 0000000..748ee10
 +    }
 +    free(line);
 +    fclose(f);
++    return 0;
++}
++
++int xbox_FramebufferDumpBmp(const char *path)
++{
++    if (!s_rgb || !s_fb_va || write_bmp(path, s_rgb, s_fb_width, s_fb_height) != 0)
++        return -1;
 +    if (!s_dump_quiet)
 +        fprintf(stderr, "  [FBWIN] wrote %s (%ux%u from 0x%08X)\n",
 +                path, s_fb_width, s_fb_height, s_fb_va);
@@ -6929,8 +6934,9 @@ index 0000000..748ee10
 +}
 +
 +/* RECOMP_SNAP_TRIGGER=<file>: when it appears, dump the shown frame to the BMP
-+ * path it contains and delete it. */
-+static void snap_trigger_poll(void)
++ * path it contains and delete it. hi: the GPU backend's full-resolution frame
++ * when that is what the window shows (s_rgb is not updated then). */
++static void snap_trigger_poll(const uint32_t *hi, uint32_t hi_w, uint32_t hi_h)
 +{
 +    static int checked;
 +    static const char *trig;
@@ -6953,7 +6959,9 @@ index 0000000..748ee10
 +        n--;
 +    path[n] = 0;
 +    unlink(trig);
-+    if (n) {
++    if (n && hi) {
++        write_bmp(path, hi, hi_w, hi_h);
++    } else if (n) {
 +        s_dump_quiet = 1;
 +        xbox_FramebufferDumpBmp(path);
 +        s_dump_quiet = 0;
@@ -7044,6 +7052,7 @@ index 0000000..748ee10
 +                SDL_RenderClear(ren);
 +                SDL_RenderCopy(ren, hi_tex, NULL, NULL);
 +                SDL_RenderPresent(ren);
++                snap_trigger_poll(hi_rgb, hi_w, hi_h);
 +                goto shown;
 +            }
 +        } else {
@@ -7071,6 +7080,7 @@ index 0000000..748ee10
 +        SDL_RenderClear(ren);
 +        SDL_RenderCopy(ren, tex, NULL, NULL);
 +        SDL_RenderPresent(ren);
++        snap_trigger_poll(NULL, 0, 0);
 +shown:
 +        {
 +            double now = now_ms();
@@ -7083,7 +7093,6 @@ index 0000000..748ee10
 +                t0 = now; f0 = f;
 +            }
 +        }
-+        snap_trigger_poll();
 +    }
 +    if (hi_tex) SDL_DestroyTexture(hi_tex);
 +    free(hi_rgb);
